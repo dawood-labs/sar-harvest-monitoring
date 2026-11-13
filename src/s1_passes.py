@@ -22,11 +22,12 @@ ACRE_M2 = 4046.8564224
 log = logging.getLogger("s1_passes")
 
 
-def init_ee(gee: dict) -> None:
-    """Start Earth Engine with the service-account key named in the config."""
+def init_ee(gee: dict, high_volume: bool = False) -> None:
+    """Start Earth Engine with the service-account key named in the config (high_volume = many pixel requests)."""
     import json
     email = json.load(open(gee["key_file"]))["client_email"]
-    ee.Initialize(ee.ServiceAccountCredentials(email, gee["key_file"]), project=gee["project"])
+    url = "https://earthengine-highvolume.googleapis.com" if high_volume else None
+    ee.Initialize(ee.ServiceAccountCredentials(email, gee["key_file"]), project=gee["project"], opt_url=url)
 
 
 def main(cfg_path: str = "configs/config.yaml") -> None:
