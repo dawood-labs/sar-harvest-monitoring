@@ -45,3 +45,23 @@ def smooth_in_mask(db: np.ndarray, rows: np.ndarray, cols: np.ndarray, size: int
 
     with ThreadPoolExecutor(workers()) as ex:      # one date per thread; numpy / scipy release the GIL
         return np.stack(list(ex.map(one, db)))
+
+
+def local_std_in_mask(db: np.ndarray, rows: np.ndarray, cols: np.ndarray, size: int = 5) -> np.ndarray:
+    """Spread (standard deviation, dB) of each pixel's size x size neighbourhood, crop-mask pixels only.
+
+    Why: standing cane and a cut field differ in texture as well as in level. db = (dates, pixels).
+    """
+    shape = (int(rows.max()) + 1, int(cols.max()) + 1)
+
+    def one(line: np.ndarray) -> np.ndarray:
+        ok = np.isfinite(line)
+        v, w = np.zeros(shape, "float32"), np.zeros(shape, "float32")
+        v[rows[ok], cols[ok]] = line[ok]
+        w[rows[ok], cols[ok]] = 1
+        n = np.maximum(uniform_filter(w, size), 1e-6)
+        mean, sq = uniform_filter(v, size) / n, uniform_filter(v * v, size) / n
+        return np.sqrt(np.maximum(sq - mean * mean, 0))[rows, cols]
+
+    with ThreadPoolExecutor(workers()) as ex:
+        return np.stack(list(ex.map(one, db)))
