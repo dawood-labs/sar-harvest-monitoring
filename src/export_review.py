@@ -10,6 +10,7 @@ Output in outputs/review_patches/ (everything opens styled in QGIS):
                                                (user_verdict, user_note) to fill in
   <aoi>_<area>_review_s2_<date>_v1.tif + .qml  every optical date, cut to 500 m around the patches, shown as B5, B3, B2
   <aoi>_<area>_review_sheet_v1.png             per patch: SAR curve and optical greenness curve
+  <aoi>_<area>_review_chips_v1.png             per patch: the optical image on dates spread over the record
   <aoi>_<area>_review_patches_v1.zip           all of the above
 
 Usage: python src/export_review.py <area_name>
@@ -107,12 +108,12 @@ def main(area: str) -> None:
         (r0, r1), (c0, c1) = sorted([int((tr.f - y1) / 10), int((tr.f - y0) / 10)]), sorted([int((x0 - tr.c) / 10), int((x1 - tr.c) / 10)])
         near[max(r0, 0):r1, max(c0, 0):c1] = True
     files = sorted((Path(cfg["paths"]["raw"]) / "s2").glob(f"{cfg['aoi']}_s2_*.tif"))
-    limits = None
+    with rasterio.open(Path(cfg["paths"]["raw"]) / "s2" / f"{cfg['aoi']}_s2_{cfg['report_dates'][0]}.tif") as r:
+        a = r.read()                                    # stretch taken from a clear report-date image
+    limits = [tuple(np.percentile(a[b - 1][near & (a[b - 1] > 0)], [2, 98])) for b in (4, 2, 1)]
     for f in files:
         with rasterio.open(f) as r:
             a, prof = r.read(), r.profile
-        if limits is None:
-            limits = [tuple(np.percentile(a[b - 1][near & (a[b - 1] > 0)], [2, 98])) for b in (4, 2, 1)]
         a[:, ~near] = 0
         p = out / f"{stem}_s2_{f.stem[-10:]}_v1.tif"
         with rasterio.open(p, "w", **{**prof, "compress": "deflate", "predictor": 2}) as dst:
@@ -145,9 +146,32 @@ def main(area: str) -> None:
     fig.tight_layout()
     fig.savefig(out / f"{stem}_sheet_v1.png"); plt.close(fig)
 
+    # Chip sheet: every patch on up to 10 optical dates spread over the whole record (always incl. the report dates).
+    all_dates = [f.stem[-10:] for f in files]
+    spread = {all_dates[i] for i in np.linspace(0, len(all_dates) - 1, 8).round().astype(int)}
+    show = sorted(spread | (set(cfg["report_dates"]) & set(all_dates)))
+    fig, axes = plt.subplots(len(review), len(show), figsize=(2.2 * len(show), 2.4 * len(review)), squeeze=False)
+    for j, date in enumerate(show):
+        with rasterio.open(files[all_dates.index(date)]) as r:
+            a = r.read([4, 2, 1]).astype("float32")
+        rgb = np.dstack([np.clip((b - lo) / (hi - lo), 0, 1) for b, (lo, hi) in zip(a, limits)])
+        for i, (_, p) in enumerate(review.iterrows()):
+            cx, cy = p.geometry.centroid.x, p.geometry.centroid.y
+            r0, c0 = int((tr.f - cy) / 10) - 30, int((cx - tr.c) / 10) - 30
+            r0, c0 = int(np.clip(r0, 0, shape2d[0] - 60)), int(np.clip(c0, 0, shape2d[1] - 60))
+            img = rasterio.features.rasterize([(p.geometry, 1)], out_shape=shape2d, transform=tr, dtype="uint8")
+            ax = axes[i, j]
+            ax.imshow(rgb[r0:r0 + 60, c0:c0 + 60], interpolation="nearest")
+            ax.contour(img[r0:r0 + 60, c0:c0 + 60], [0.5], colors=["#ffff00"], linewidths=1.2)
+            ax.set_xticks([]); ax.set_yticks([]); ax.grid(False)
+            ax.set_title(f"{p.patch_id}  {date}" if j == 0 else date, fontsize=8.5,
+                         color="#ffcf5c" if date in cfg["report_dates"] else tf.INK)
+    fig.tight_layout()
+    fig.savefig(out / f"{stem}_chips_v1.png"); plt.close(fig)
+
     with zipfile.ZipFile(out / f"{stem}_patches_v1.zip", "w", zipfile.ZIP_DEFLATED) as z:
         for f in sorted(out.iterdir()):
-            if f.suffix != ".zip":
+            if f.suffix != ".zip" and "_v2" not in f.name:
                 z.write(f, f.name)
     print(review.drop(columns=["geometry", "question", "user_verdict", "user_note"]).to_string(index=False))
     print("zip MB", round((out / f"{stem}_patches_v1.zip").stat().st_size / 1e6, 1))

@@ -6,7 +6,7 @@ is the same place in every file. A finished file is skipped on a re-run (resume)
 
 Usage: python src/download.py <area.gpkg> [configs/config.yaml] [s2_start s2_end]
        With s2_start and s2_end (YYYY-MM-DD) every Sentinel-2 date in that range that is at least half clear is
-       fetched too (extra check images), and nothing else is downloaded again.
+       fetched too (extra check images); files that already exist are never downloaded again.
 Only pixels inside the crop mask are kept for SAR; nothing outside it is processed anywhere in the project.
 
 Output: data/raw/s1/<aoi>_s1_ro<track>_<asc|des>_<date>.tif   VV, VH (dB), angle (deg); float32, NaN = outside the mask
@@ -197,7 +197,8 @@ def main(area_file: str, cfg_path: str = "configs/config.yaml", s2_start: str = 
     inside = cane_mask(grid, cfg, Path(cfg["paths"]["interim"]) / f"{cfg['aoi']}_cane_mask_{Path(area_file).stem.split('_', 1)[-1]}.tif")
     for sub in ("s1", "s2"):
         (raw / sub).mkdir(parents=True, exist_ok=True)
-    jobs = s2_range_jobs(cfg, box, raw, s2_start, s2_end) if s2_start else s1_jobs(cfg, box, raw) + s2_jobs(cfg, box, raw)
+    # Extra optical dates only when a range is given; the SAR job list is always complete (finished files are skipped).
+    jobs = s1_jobs(cfg, box, raw) + (s2_range_jobs(cfg, box, raw, s2_start, s2_end) if s2_start else s2_jobs(cfg, box, raw))
     # Network-bound work: more threads than cores is fine; memory per file is small (one image in RAM).
     n = min(len(jobs), 20, max(1, workers(mem_per_worker_gb=0.5)) * 3)
     log.info("crop mask inside the grid: %.1f acres (%.0f%% of the pixels)", inside.sum() * RES * RES / 4046.8564224, 100 * inside.mean())
