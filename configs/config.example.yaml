@@ -1,6 +1,6 @@
 # All settings live here, not in the code. Copy to config.yaml and fill in.
 aoi: myaoi                                             # short lower-case name used in file names
-season: {start: "YYYY-MM-DD", end: "YYYY-MM-DD"}       # crop-mask date -> after the last report date
+season: {start: "YYYY-MM-DD", end: "YYYY-MM-DD"}       # one week before the crop-mask date -> after the last report date
 crs: {work: "EPSG:XXXXX", deliver: "EPSG:4326"}        # work = local UTM zone (area in metres)
 classes: {remaining_cane: 81, harvested: 82, cloud: 232}   # codes written in the field `predicted`
 min_piece_acres: 0.2                                   # pieces smaller than this are treated as slivers
