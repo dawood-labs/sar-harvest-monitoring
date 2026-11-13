@@ -4,7 +4,9 @@ Why: the SAR method needs each pass as its own image, kept per track; optical is
 Pixels are read straight from Earth Engine in 1024 x 1024 blocks onto one fixed 10 m grid, so pixel (row, col)
 is the same place in every file. A finished file is skipped on a re-run (resume).
 
-Usage: python src/download.py <area.gpkg> [configs/config.yaml]
+Usage: python src/download.py <area.gpkg> [configs/config.yaml] [s2_start s2_end]
+       With s2_start and s2_end (YYYY-MM-DD) every Sentinel-2 date in that range that is at least half clear is
+       fetched too (extra check images), and nothing else is downloaded again.
 Only pixels inside the crop mask are kept for SAR; nothing outside it is processed anywhere in the project.
 
 Output: data/raw/s1/<aoi>_s1_ro<track>_<asc|des>_<date>.tif   VV, VH (dB), angle (deg); float32, NaN = outside the mask
@@ -143,6 +145,26 @@ def s2_jobs(cfg: dict, box: ee.Geometry, raw: Path) -> list[dict]:
     return jobs
 
 
+def s2_range_jobs(cfg: dict, box: ee.Geometry, raw: Path, start: str, end: str) -> list[dict]:
+    """Every Sentinel-2 date between start and end whose clear share over the area is at least 0.5."""
+    cs = ee.ImageCollection("GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED")
+    ids = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED").filterBounds(box).filterDate(start, end)
+           .aggregate_array("system:index").getInfo())
+
+    def clear_share(day: str) -> float:
+        same = [i for i in ids if i[:8] == day]
+        score = ee.ImageCollection([cs.filter(ee.Filter.eq("system:index", i)).first() for i in same]).mosaic()
+        return score.select("cs_cdf").gte(0.6).reduceRegion(ee.Reducer.mean(), box, 100).get("cs_cdf").getInfo() or 0
+
+    days = sorted({i[:8] for i in ids})
+    with ThreadPoolExecutor(min(len(days), 16)) as ex:
+        clear = dict(zip(days, ex.map(clear_share, days)))
+    log.info("clear share per Sentinel-2 date: %s", {k: round(v, 2) for k, v in clear.items()})
+    return [{"sensor": "s2", "date": f"{day[:4]}-{day[4:6]}-{day[6:]}", "report": "", "ids": [i for i in ids if i[:8] == day],
+             "clear_share": round(clear[day], 3), "out": raw / "s2" / f"{cfg['aoi']}_s2_{day[:4]}-{day[4:6]}-{day[6:]}.tif",
+             "bands": cfg["s2_bands"] + ["cs_cdf"], "dtype": "uint16", "fill": 0} for day in days if clear[day] >= 0.5]
+
+
 def run(job: dict, grid: dict, inside: np.ndarray) -> dict:
     t0 = time.time()
     if not job["out"].exists():
@@ -164,7 +186,7 @@ def run(job: dict, grid: dict, inside: np.ndarray) -> dict:
     return {**row, "file": job["out"].name, "mb": round(job["out"].stat().st_size / 1e6, 1), "seconds": round(time.time() - t0, 1)}
 
 
-def main(area_file: str, cfg_path: str = "configs/config.yaml") -> None:
+def main(area_file: str, cfg_path: str = "configs/config.yaml", s2_start: str = "", s2_end: str = "") -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     cfg = yaml.safe_load(open(cfg_path))
     init_ee(cfg["gee"], high_volume=True)
@@ -175,7 +197,7 @@ def main(area_file: str, cfg_path: str = "configs/config.yaml") -> None:
     inside = cane_mask(grid, cfg, Path(cfg["paths"]["interim"]) / f"{cfg['aoi']}_cane_mask_{Path(area_file).stem.split('_', 1)[-1]}.tif")
     for sub in ("s1", "s2"):
         (raw / sub).mkdir(parents=True, exist_ok=True)
-    jobs = s1_jobs(cfg, box, raw) + s2_jobs(cfg, box, raw)
+    jobs = s2_range_jobs(cfg, box, raw, s2_start, s2_end) if s2_start else s1_jobs(cfg, box, raw) + s2_jobs(cfg, box, raw)
     # Network-bound work: more threads than cores is fine; memory per file is small (one image in RAM).
     n = min(len(jobs), 20, max(1, workers(mem_per_worker_gb=0.5)) * 3)
     log.info("crop mask inside the grid: %.1f acres (%.0f%% of the pixels)", inside.sum() * RES * RES / 4046.8564224, 100 * inside.mean())
@@ -183,11 +205,11 @@ def main(area_file: str, cfg_path: str = "configs/config.yaml") -> None:
     t0 = time.time()
     with ThreadPoolExecutor(n) as ex:
         rows = list(ex.map(lambda j: run(j, grid, inside), jobs))
-    out = Path(cfg["paths"]["interim"]) / f"{cfg['aoi']}_download_manifest.csv"
+    out = Path(cfg["paths"]["interim"]) / f"{cfg['aoi']}_download_manifest{'_s2_extra' if s2_start else ''}.csv"
     df = pd.DataFrame(rows).sort_values(["sensor", "date"])
     df.to_csv(out, index=False)
     log.info("done: %d files, %.0f MB, %.0f s wall; manifest %s", len(df), df.mb.sum(), time.time() - t0, out)
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:3])
+    main(*sys.argv[1:5])
