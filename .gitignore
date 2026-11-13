@@ -1,0 +1,22 @@
+# data, models and outputs never go into git
+data/
+runs/
+outputs/
+qc/
+reports/
+docs/*.docx
+*.tif
+*.parquet
+*.gpkg
+*.shp
+*.dbf
+*.shx
+*.pkl
+*.joblib
+*.rar
+*.zip
+.env
+*credentials*
+configs/config.yaml
+.ipynb_checkpoints/
+__pycache__/

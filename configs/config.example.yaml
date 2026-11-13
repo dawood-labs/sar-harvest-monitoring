@@ -1,0 +1,14 @@
+# All settings live here, not in the code. Copy to config.yaml and fill in.
+aoi: myaoi                                             # short lower-case name used in file names
+season: {start: "YYYY-MM-DD", end: "YYYY-MM-DD"}       # crop-mask date -> after the last report date
+crs: {work: "EPSG:XXXXX", deliver: "EPSG:4326"}        # work = local UTM zone (area in metres)
+classes: {remaining_cane: 81, harvested: 82, cloud: 232}   # codes written in the field `predicted`
+min_piece_acres: 0.2                                   # pieces smaller than this are treated as slivers
+report_dates: ["YYYY-MM-DD"]                           # dates a harvest report is needed for
+paths:
+  raw: data/raw
+  reference_reports: data/raw/reference_reports        # crop mask + older harvest reports (read-only)
+  interim: data/interim
+  final: data/final
+  bucket: ""                                           # permanent storage; the machine disk is temporary
+seed: 42
