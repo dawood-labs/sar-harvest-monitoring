@@ -13,7 +13,7 @@ curve of the patch against standing cane.
 
 All optical dates found in data/raw/s2 are also used to see when (and whether) each patch was really cut.
 
-Usage: python src/disagreement_figures.py <area_name>
+Usage: python src/disagreement_figures.py <area_name> [tag]
 Output: data/interim/<aoi>_disagreement_causes_<area>.csv, reports/figures/<aoi>_<area>_disagreement_*.png
 """
 from __future__ import annotations
@@ -76,7 +76,7 @@ def examples(cfg, d, df, labels, kind, out, n_rows=6):
             ax.set_xticks([]); ax.set_yticks([]); ax.grid(False)
         ax = row[3]
         y, known = harvested_by(d, reports.index(p.report) + 1)
-        standing = known & ~y & ~np.load(Path(cfg["paths"]["interim"]) / f"{cfg['aoi']}_transfer_pred_{sys.argv[1]}.npz")[f"pred_{p.report}"]
+        standing = d["group"] == 0                     # standing through the last original report
         for t, color in zip(cfg["s1_tracks"], ("#3987e5", "#c98500")):
             dates = pd.to_datetime(d[f"dates_{t}"])
             ax.plot(dates, np.nanmedian(d[f"vh_{t}"][:, m], axis=1), color=color, lw=2, marker="o", ms=4, label=f"patch, track {int(t):03d}")
@@ -139,9 +139,10 @@ def optical_history(cfg, d, df, labels, out):
     return df
 
 
-def main(area: str) -> None:
+def main(area: str, tag: str = "") -> None:
     cfg, d = load_pixels(area)
     interim, figs = Path(cfg["paths"]["interim"]), Path("reports/figures")
+    area = area + tag                                  # tag = which predictions were analysed (see disagreement_eda.py)
     df = pd.read_csv(interim / f"{cfg['aoi']}_disagreement_patches_{area}.csv")
     df["cause"] = df.apply(cause, axis=1)
     labels = np.load(interim / f"{cfg['aoi']}_disagreement_labels_{area}.npz")
@@ -171,4 +172,4 @@ def main(area: str) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main(*sys.argv[1:3])

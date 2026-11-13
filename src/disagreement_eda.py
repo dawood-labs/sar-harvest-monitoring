@@ -8,7 +8,8 @@ A patch = disagreement pixels that survive a 5 x 5 opening (so strips thinner th
 least MIN_ACRES. Two kinds: "missed" (original report: harvested, SAR: standing) and "extra" (original report:
 standing, SAR: harvested).
 
-Usage: python src/disagreement_eda.py <area_name>
+Usage: python src/disagreement_eda.py <area_name> [predictions.npz "<variant>" <tag> <min_acres> <width_pixels>]
+       Without the extra arguments the first method's predictions are used (patches >= 1 acre, >= 50 m wide).
 Output: data/interim/<aoi>_disagreement_patches_<area>.csv and ..._labels_<area>.npz (patch id per pixel, per date)
 """
 from __future__ import annotations
@@ -38,56 +39,72 @@ def ndvi_by_date(cfg: dict, d: dict) -> dict:
     return out
 
 
-def patches(sel: np.ndarray, d: dict) -> np.ndarray:
-    """Patch id per crop-mask pixel (0 = not in a big patch)."""
+def patches(sel: np.ndarray, d: dict, min_acres: float = MIN_ACRES, width: int = 5) -> np.ndarray:
+    """Patch id per crop-mask pixel (0 = not in a big patch). width = opening size in pixels (thinner strips vanish)."""
     img = np.zeros(grid_shape(d), bool)
     img[d["rows"], d["cols"]] = sel
-    lab, n = ndimage.label(ndimage.binary_opening(img, np.ones((5, 5), bool)))
+    lab, n = ndimage.label(ndimage.binary_opening(img, np.ones((width, width), bool)))
     size = np.bincount(lab.ravel())
-    small = np.flatnonzero(size * ACRE_PER_PIXEL < MIN_ACRES)
+    small = np.flatnonzero(size * ACRE_PER_PIXEL < min_acres)
     lab[np.isin(lab, small)] = 0
     return lab[d["rows"], d["cols"]]
 
 
-def main(area: str) -> None:
+def main(area: str, npz: str = "", variant: str = "", tag: str = "", min_acres: float = MIN_ACRES, width: int = 5) -> None:
     cfg, d = load_pixels(area)
     interim = Path(cfg["paths"]["interim"])
-    z = np.load(interim / f"{cfg['aoi']}_transfer_pred_{area}.npz")
+    z = np.load(npz or interim / f"{cfg['aoi']}_transfer_pred_{area}.npz")
+    key = (lambda r: f"{variant}|{r}") if variant else (lambda r: f"pred_{r}")
     ndvi, test, reports = ndvi_by_date(cfg, d), split(d), cfg["report_dates"]
     tracks = list(cfg["s1_tracks"])
     rows, labels = [], {}
     earlier = np.zeros(len(d["group"]), bool)
     for n, report in enumerate(reports, 1):
         y, known = harvested_by(d, n)
-        pred = z[f"pred_{report}"]
+        pred = z[key(report)]
         own = pred & ~earlier                                  # found on this date itself, not carried over
         standing = known & ~y & ~pred                          # both agree: standing -> the reference level per pass
         for kind, sel in (("missed", known & y & ~pred), ("extra", known & ~y & pred)):
-            lab = patches(sel, d)
+            lab = patches(sel, d, float(min_acres), int(width))
             labels[f"{kind}_{report}"] = lab.astype("int32")
-            for pid in np.unique(lab)[1:]:
-                m = lab == pid
-                row = {"report": report, "kind": kind, "patch": int(pid), "acres": round(m.sum() * ACRE_PER_PIXEL, 2),
-                       "row": int(d["rows"][m].mean()), "col": int(d["cols"][m].mean()), "test_share": round(test[m].mean(), 2),
-                       "prob": round(float(z[f"prob_{report}"][m].mean()), 2), "carried_over_share": round(float((~own[m]).mean()), 2),
-                       "original_group": int(np.bincount(d["group"][m]).argmax())}
-                for date in reports:
-                    row[f"ndvi_{date}"] = round(float(np.median(ndvi[date][m])), 2)
-                for t in tracks:                               # patch VH minus standing cane's VH, per pass
-                    dates = d[f"dates_{t}"]
-                    rel = np.nanmedian(d[f"vh_{t}"][:, m], axis=1) - np.nanmedian(d[f"vh_{t}"][:, standing], axis=1)
-                    before = dates <= report
-                    row[f"vh{t}_last"] = round(float(rel[before][-1]), 1)
-                    row[f"vh{t}_min_before"] = round(float(rel[before].min()), 1)
-                    row[f"vh{t}_next"] = round(float(rel[~before][0]), 1) if (~before).any() else np.nan
-                    row[f"vh{t}_first_low"] = next((x for x, v in zip(dates, rel) if v <= -2.5), "")
-                rows.append(row)
+            idx = np.flatnonzero(lab > 0)
+            if len(idx) == 0:
+                continue
+            ids, inv = np.unique(lab[idx], return_inverse=True)
+            count = np.bincount(inv)
+
+            def patch_mean(v: np.ndarray) -> np.ndarray:           # mean of v inside every patch, all patches at once
+                x = v[idx].astype("float64")
+                ok = np.isfinite(x)
+                return np.bincount(inv, weights=np.where(ok, x, 0)) / np.maximum(np.bincount(inv, weights=ok), 1)
+
+            part = pd.DataFrame({"report": report, "kind": kind, "patch": ids, "acres": (count * ACRE_PER_PIXEL).round(2),
+                                 "row": patch_mean(d["rows"]).astype(int), "col": patch_mean(d["cols"]).astype(int),
+                                 "test_share": patch_mean(test).round(2),
+                                 "prob": patch_mean(z[f"prob_{report}"]).round(2) if f"prob_{report}" in z.files else np.nan,
+                                 "carried_over_share": patch_mean(~own).round(2),
+                                 "original_group": np.argmax([patch_mean(d["group"] == g) for g in range(len(reports) + 1)], axis=0)})
+            img = np.zeros(grid_shape(d), "int32")                # widest place of each patch: tells a strip from a field
+            img[d["rows"], d["cols"]] = lab
+            part["widest_m"] = (ndimage.maximum(ndimage.distance_transform_edt(img > 0), img, ids) * 20).round(0)
+            for date in reports:
+                part[f"ndvi_{date}"] = patch_mean(ndvi[date]).round(2)
+            for t in tracks:                                       # patch VH minus standing cane's VH, per pass
+                dates = d[f"dates_{t}"]
+                rel = np.array([patch_mean(v) for v in d[f"vh_{t}"]]) - np.nanmedian(d[f"vh_{t}"][:, standing], axis=1)[:, None]
+                before = dates <= report
+                part[f"vh{t}_last"] = rel[before][-1].round(1)
+                part[f"vh{t}_min_before"] = rel[before].min(0).round(1)
+                part[f"vh{t}_next"] = rel[~before][0].round(1) if (~before).any() else np.nan
+                low = rel <= -2.5
+                part[f"vh{t}_first_low"] = np.where(low.any(0), dates[np.argmax(low, axis=0)], "")
+            rows.append(part)
         earlier = pred
-    df = pd.DataFrame(rows)
-    df.to_csv(interim / f"{cfg['aoi']}_disagreement_patches_{area}.csv", index=False)
-    np.savez_compressed(interim / f"{cfg['aoi']}_disagreement_labels_{area}.npz", **labels)
+    df = pd.concat(rows, ignore_index=True)
+    df.to_csv(interim / f"{cfg['aoi']}_disagreement_patches_{area}{tag}.csv", index=False)
+    np.savez_compressed(interim / f"{cfg['aoi']}_disagreement_labels_{area}{tag}.npz", **labels)
     print(df.groupby(["report", "kind"]).acres.agg(["count", "sum", "median", "max"]).round(1))
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main(*sys.argv[1:7])
