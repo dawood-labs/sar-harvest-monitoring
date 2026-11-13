@@ -12,3 +12,5 @@ paths:
   final: data/final
   bucket: ""                                           # permanent storage; the machine disk is temporary
 seed: 42
+gee: {key_file: "", project: ""}                       # Earth Engine service-account key and project
+crop_mask: ""                                          # polygons of standing cane at the start of the season
