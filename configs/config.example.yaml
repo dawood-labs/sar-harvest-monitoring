@@ -14,3 +14,6 @@ paths:
 seed: 42
 gee: {key_file: "", project: ""}                       # Earth Engine service-account key and project
 crop_mask: ""                                          # polygons of standing cane at the start of the season
+s1_tracks: {}                                          # relative orbit: DESCENDING | ASCENDING (see src/s1_passes.py)
+s2_bands: [B2, B3, B4, B5, B8]                         # optical bands, used only to check results
+gee_workload_tag: harvest-sar                          # label under which Earth Engine compute is metered

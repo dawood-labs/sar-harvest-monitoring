@@ -8,8 +8,8 @@ without needing a cloud-free optical image.
 
 ## Status
 
-Research stage. The project structure, settings and the machine resource helper are in place. The SAR method is
-being developed and tested; code for each step is added here once it has been run and checked.
+Research stage. On a first test area the harvest signal is clear in Sentinel-1 (VH falls about 4 dB when a field is
+cut) and a model trained on some report dates also works on a date it never saw. Next: the whole area.
 
 ## Why SAR
 
@@ -27,18 +27,38 @@ disappears.
 | 4. Check | Compare with existing harvest reports and optical images of the same dates | error maps and scores |
 | 5. Polygons | Clean the raster, build polygons, add class code and area, check that the classes add up to the crop mask | report file |
 
+## Steps and commands
+
+Run from the project folder. `<area>` is the name of an area file, e.g. `test_tile`.
+
+| Step | Command | Output |
+|---|---|---|
+| List the Sentinel-1 passes (free, metadata only) | `python src/s1_passes.py` | `data/interim/<aoi>_s1_passes_*.csv` |
+| Pick a small test area | `python src/pick_test_tile.py` | `data/interim/<aoi>_test_tile.gpkg` |
+| Download Sentinel-1 (+ Sentinel-2 for checking) | `python src/download.py data/interim/<aoi>_test_tile.gpkg` | `data/raw/s1`, `data/raw/s2`, crop-mask raster |
+| Cache the crop-mask pixels and their time series | `python src/eda_prepare.py <area>` | `data/interim/<aoi>_eda_pixels_<area>.npz` |
+| Compare three detectors on each report date | `python src/compare_detectors.py <area> 5` | scores csv |
+| EDA figures and report | `python src/eda_figures.py <area>` then `python src/embed_figures.py <template> <out.html>` | `reports/` |
+| Test on a date the model never saw | `python src/transfer_test.py <area>` then `python src/transfer_figures.py <area>` | scores csv, predictions, figures |
+| Files for QGIS | `python src/export_qgis.py <area>` | `outputs/` rasters with styles + polygons |
+
+Rules built into the code: only pixels inside the crop mask are processed; only passes on or before the report
+date are used; each orbit track is compared with its own earlier passes, tracks are never mixed in one image;
+train and test pixels come from different 3 km blocks.
+
 ## Folders
 
 ```
 configs/    config.example.yaml (copy to config.yaml and fill in)
-src/        reusable code; resources.py decides workers and chunk sizes from the machine
+src/        all scripts; resources.py decides workers and chunk sizes from the machine
 data/       raw (read-only), interim, final      - not in git
 runs/ outputs/ reports/ qc/                      - not in git
 ```
 
 ## Setup
 
-1. Python 3.10+ with the usual geospatial stack (geopandas, rasterio, numpy, pandas).
+1. Python 3.10+ with geopandas, rasterio, numpy, pandas, scipy, scikit-learn, scikit-image, lightgbm, matplotlib,
+   earthengine-api and an Earth Engine service-account key.
 2. `cp configs/config.example.yaml configs/config.yaml` and fill in the area name, dates, UTM zone and paths.
 3. Put the crop mask and any older harvest reports in `data/raw/reference_reports/`.
 4. `python src/resources.py` prints the cores and memory the code will use on this machine.
