@@ -20,3 +20,4 @@ docs/*.docx
 configs/config.yaml
 .ipynb_checkpoints/
 __pycache__/
+logs/
