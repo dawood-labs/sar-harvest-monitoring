@@ -3,7 +3,8 @@
 Why: all EDA figures and tests read this one cached file instead of re-reading 21 rasters each time.
 Report groups come from the reference harvest reports (they are incremental):
   0 = still standing at the last report, 1..n = reported harvested in report 1..n, 255 = in the mask but in no report.
-Only pixels inside the crop mask are read.
+Only pixels inside the crop mask are read. Pixels the original report marks as cloud on a date are stored as
+cloud_<n> so that date is not scored there.
 
 Usage: python src/eda_prepare.py <area_name> [configs/config.yaml]      e.g. test_tile
 Output: data/interim/<aoi>_eda_pixels_<area>.npz  (rows, cols, group, dates_<track>, vv_<track>, vh_<track>; dB x 100 int16)
@@ -32,6 +33,8 @@ def read_masked(path: str, inside: np.ndarray) -> np.ndarray:
     """VV and VH of one pass at the crop-mask pixels, as dB x 100 (int16, -32768 = no data)."""
     with rasterio.open(path) as r:
         a = r.read([1, 2])[:, inside]
+        if r.dtypes[0] == "int16":                         # already dB x 100 (large-area downloads)
+            return a
     return np.where(np.isfinite(a), np.round(a * 100), -32768).astype("int16")
 
 
@@ -43,7 +46,7 @@ def main(area: str, cfg_path: str = "configs/config.yaml") -> None:
         inside, tr, shape, crs = r.read(1) == 1, r.transform, r.shape, r.crs
     rows, cols = np.nonzero(inside)
 
-    group = np.full(shape, 255, "uint8")
+    group, clouds = np.full(shape, 255, "uint8"), {}
     codes = cfg["classes"]
     reports = sorted(f for f in glob.glob(str(Path(cfg["paths"]["reference_reports"]) / "*.shp")) if f != cfg["crop_mask"])
     bounds = rasterio.transform.array_bounds(*shape, tr)
@@ -51,6 +54,8 @@ def main(area: str, cfg_path: str = "configs/config.yaml") -> None:
         g = gpd.read_file(f).to_crs(crs).cx[bounds[0]:bounds[2], bounds[1]:bounds[3]]
         cut = rasterize([(x, 1) for x in g.geometry[g.predicted == codes["harvested"]]], out_shape=shape, transform=tr, dtype="uint8")
         group[(cut == 1) & (group == 255)] = i
+        if (g.predicted == codes["cloud"]).any():          # cloud in the original report: no answer there on this date
+            clouds[i] = rasterize([(x, 1) for x in g.geometry[g.predicted == codes["cloud"]]], out_shape=shape, transform=tr, dtype="uint8")[inside] == 1
         if i == len(reports):
             stand = rasterize([(x, 1) for x in g.geometry[g.predicted == codes["remaining_cane"]]], out_shape=shape, transform=tr, dtype="uint8")
             group[(stand == 1) & (group == 255)] = 0
@@ -58,7 +63,10 @@ def main(area: str, cfg_path: str = "configs/config.yaml") -> None:
     for v in np.unique(group):
         log.info("group %3d: %9.1f acres", v, (group == v).sum() * ACRE_PER_PIXEL)
 
-    out = {"rows": rows.astype("int16"), "cols": cols.astype("int16"), "group": group}
+    out = {"rows": rows.astype("int16"), "cols": cols.astype("int16"), "group": group,
+           **{f"cloud_{i}": c for i, c in clouds.items()}}
+    for i, c in clouds.items():
+        log.info("report %d: %.1f acres under cloud in the original report (not scored on that date)", i, c.sum() * ACRE_PER_PIXEL)
     for track, direction in cfg["s1_tracks"].items():
         files = sorted(glob.glob(str(raw / "s1" / f"{cfg['aoi']}_s1_ro{int(track):03d}_{direction[:3].lower()}_*.tif")))
         with ThreadPoolExecutor(workers()) as ex:      # reading + decompression releases the GIL

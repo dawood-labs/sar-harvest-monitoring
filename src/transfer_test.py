@@ -41,9 +41,15 @@ def grid_shape(d: dict) -> tuple[int, int]:
 
 
 def harvested_by(d: dict, n: int) -> tuple[np.ndarray, np.ndarray]:
-    """(label, known) for report n: harvested in report 1..n vs still standing; known = pixel is in a report."""
+    """(label, known) for report n: harvested in report 1..n vs still standing; known = the report has an answer.
+
+    Pixels the original report n marks as cloud have no answer on that date (later reports cover them again).
+    """
     g = d["group"]
-    return (g >= 1) & (g <= n), g != 255
+    known = g != 255
+    if f"cloud_{n}" in d:
+        known = known & ~d[f"cloud_{n}"]
+    return (g >= 1) & (g <= n), known
 
 
 def near_edge(d: dict, y: np.ndarray, known: np.ndarray) -> np.ndarray:
