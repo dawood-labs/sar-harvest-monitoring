@@ -32,7 +32,7 @@ import yaml
 from resources import workers
 from s1_passes import init_ee
 
-RES, BLOCK = 10, 1024
+RES, BLOCK = 10, 1024      # BLOCK is replaced by `download_block` from the config when given
 log = logging.getLogger("download")
 
 
@@ -118,7 +118,10 @@ def s1_jobs(cfg: dict, box: ee.Geometry, raw: Path) -> list[dict]:
             date = f"{day[:4]}-{day[4:6]}-{day[6:]}"
             name = f"{cfg['aoi']}_s1_ro{int(track):03d}_{direction[:3].lower()}_{date}.tif"
             jobs.append({"sensor": "s1", "date": date, "track": int(track), "satellite": same[0][:3], "ids": same,
-                         "out": raw / "s1" / name, "bands": ["VV", "VH", "angle"], "dtype": "float32", "fill": np.nan})
+                         "out": raw / "s1" / name,
+                         # Large areas: only VV and VH, sent and stored as dB x 100 in int16 (half the transfer and disk).
+                         **({"bands": ["VV", "VH"], "dtype": "int16", "fill": -32768, "scale": 100} if cfg.get("s1_int16")
+                            else {"bands": ["VV", "VH", "angle"], "dtype": "float32", "fill": np.nan})})
     return jobs
 
 
@@ -138,6 +141,8 @@ def s2_jobs(cfg: dict, box: ee.Geometry, raw: Path) -> list[dict]:
             clear[day] = score.select("cs_cdf").gte(0.6).reduceRegion(ee.Reducer.mean(), box, 100).get("cs_cdf").getInfo() or 0
         log.info("report %s: clear share of the area per Sentinel-2 date %s", report, {k: round(v, 2) for k, v in clear.items()})
         day = max(clear, key=lambda k: (round(clear[k], 2), -abs((pd.Timestamp(k) - d).days)))
+        if cfg.get("s2_exact_report_dates") and d.strftime("%Y%m%d") in clear:
+            day = d.strftime("%Y%m%d")                 # the report day itself, however cloudy (cross-check needs that day)
         date = f"{day[:4]}-{day[4:6]}-{day[6:]}"
         jobs.append({"sensor": "s2", "date": date, "report": report, "ids": [i for i in ids if i[:8] == day],
                      "clear_share": round(clear[day], 3), "out": raw / "s2" / f"{cfg['aoi']}_s2_{date}.tif",
@@ -170,6 +175,8 @@ def run(job: dict, grid: dict, inside: np.ndarray) -> dict:
     if not job["out"].exists():
         if job["sensor"] == "s1":
             img = ee.ImageCollection([ee.Image(f"COPERNICUS/S1_GRD/{i}") for i in job["ids"]]).mosaic()
+            if job.get("scale"):
+                img = img.select(job["bands"]).multiply(job["scale"]).round().toInt16()
         else:
             cs = ee.ImageCollection("GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED")
             img = ee.ImageCollection([
@@ -187,8 +194,10 @@ def run(job: dict, grid: dict, inside: np.ndarray) -> dict:
 
 
 def main(area_file: str, cfg_path: str = "configs/config.yaml", s2_start: str = "", s2_end: str = "") -> None:
+    global BLOCK
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     cfg = yaml.safe_load(open(cfg_path))
+    BLOCK = int(cfg.get("download_block", BLOCK))      # small blocks skip more empty ground when the crop is scattered
     init_ee(cfg["gee"], high_volume=True)
     ee.data.setDefaultWorkloadTag(cfg["gee_workload_tag"])
     grid = make_grid(area_file, cfg["crs"]["work"])
@@ -200,13 +209,14 @@ def main(area_file: str, cfg_path: str = "configs/config.yaml", s2_start: str = 
     # Extra optical dates only when a range is given; the SAR job list is always complete (finished files are skipped).
     jobs = s1_jobs(cfg, box, raw) + (s2_range_jobs(cfg, box, raw, s2_start, s2_end) if s2_start else s2_jobs(cfg, box, raw))
     # Network-bound work: more threads than cores is fine; memory per file is small (one image in RAM).
-    n = min(len(jobs), 20, max(1, workers(mem_per_worker_gb=0.5)) * 3)
+    per_file_gb = grid["width"] * grid["height"] * 12 / 1e9 + 0.2          # one whole-grid array in RAM per file (6 x uint16 at most)
+    n = min(len(jobs), 20, max(1, workers(mem_per_worker_gb=per_file_gb, keep_free_cores=0)) * 3)
     log.info("crop mask inside the grid: %.1f acres (%.0f%% of the pixels)", inside.sum() * RES * RES / 4046.8564224, 100 * inside.mean())
     log.info("grid %d x %d px; %d files to fetch with %d threads", grid["width"], grid["height"], len(jobs), n)
     t0 = time.time()
     with ThreadPoolExecutor(n) as ex:
         rows = list(ex.map(lambda j: run(j, grid, inside), jobs))
-    out = Path(cfg["paths"]["interim"]) / f"{cfg['aoi']}_download_manifest{'_s2_extra' if s2_start else ''}.csv"
+    out = Path(cfg["paths"]["interim"]) / f"{Path(area_file).stem}_download_manifest{'_s2_extra' if s2_start else ''}.csv"
     df = pd.DataFrame(rows).sort_values(["sensor", "date"])
     df.to_csv(out, index=False)
     log.info("done: %d files, %.0f MB, %.0f s wall; manifest %s", len(df), df.mb.sum(), time.time() - t0, out)

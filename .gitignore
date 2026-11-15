@@ -21,3 +21,4 @@ configs/config.yaml
 .ipynb_checkpoints/
 __pycache__/
 logs/
+configs/config_full.yaml

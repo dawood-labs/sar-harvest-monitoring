@@ -17,3 +17,7 @@ crop_mask: ""                                          # polygons of standing ca
 s1_tracks: {}                                          # relative orbit: DESCENDING | ASCENDING (see src/s1_passes.py)
 s2_bands: [B2, B3, B4, B5, B8]                         # optical bands, used only to check results
 gee_workload_tag: harvest-sar                          # label under which Earth Engine compute is metered
+# Large areas (optional): smaller download blocks skip empty ground, SAR as int16 dB x 100, optical of the report day itself
+# download_block: 256
+# s1_int16: true
+# s2_exact_report_dates: true
