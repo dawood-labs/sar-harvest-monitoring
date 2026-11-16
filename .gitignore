@@ -17,8 +17,8 @@ docs/*.docx
 *.zip
 .env
 *credentials*
-configs/config.yaml
+configs/config*.yaml
+!configs/config.example.yaml
 .ipynb_checkpoints/
 __pycache__/
 logs/
-configs/config_full.yaml
