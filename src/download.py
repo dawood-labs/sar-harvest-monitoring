@@ -51,7 +51,7 @@ def cane_mask(grid: dict, cfg: dict, out: Path) -> np.ndarray:
     w = gpd.GeoSeries.from_wkt([f"POLYGON(({grid['x0']} {grid['y0']}, {grid['x0'] + grid['width'] * RES} {grid['y0']}, "
                                 f"{grid['x0'] + grid['width'] * RES} {grid['y0'] - grid['height'] * RES}, "
                                 f"{grid['x0']} {grid['y0'] - grid['height'] * RES}, {grid['x0']} {grid['y0']}))"], crs=grid["crs"])[0]
-    polys = gpd.read_file(cfg["crop_mask"]).to_crs(grid["crs"]).geometry
+    polys = gpd.read_file(cfg["crop_mask"]).to_crs(grid["crs"]).geometry.make_valid()   # repaired in memory only
     polys = polys[polys.intersects(w)]
     inside = rasterize([(g, 1) for g in polys], out_shape=(grid["height"], grid["width"]), transform=tr, dtype="uint8")
     with rasterio.open(out, "w", driver="GTiff", width=grid["width"], height=grid["height"], count=1, dtype="uint8",
@@ -60,17 +60,29 @@ def cane_mask(grid: dict, cfg: dict, out: Path) -> np.ndarray:
     return inside.astype(bool)
 
 
-def fetch(image: ee.Image, bands: list[str], dtype: str, fill: float, grid: dict, inside: np.ndarray | None = None) -> np.ndarray:
-    """Read `image` on the grid block by block; blocks without a crop-mask pixel are not requested at all."""
+def fetch_to_file(image: ee.Image, job: dict, grid: dict, inside: np.ndarray, threads: int) -> None:
+    """Read `image` block by block and write each block straight into the output file.
+
+    Why: memory stays small for any area size (no whole-grid array). Blocks without a crop-mask pixel are not
+    requested at all and are left empty in the file (sparse GeoTIFF, read back as no data). SAR keeps only the
+    crop-mask pixels; optical images stay whole inside the blocks that are fetched.
+    """
+    import threading
+    bands, dtype, fill = job["bands"], job["dtype"], job["fill"]
     H, W = grid["height"], grid["width"]
-    out = np.full((len(bands), H, W), fill, dtype=dtype)
     send = -9999 if np.isnan(fill) else fill      # Earth Engine cannot take NaN in a request
     img = image.select(bands).unmask(send)
-    for r0 in range(0, H, BLOCK):
-        for c0 in range(0, W, BLOCK):
+    tmp = job["out"].with_suffix(".tmp")
+    prof = dict(driver="GTiff", width=W, height=H, count=len(bands), dtype=dtype, crs=grid["crs"],
+                transform=rasterio.transform.from_origin(grid["x0"], grid["y0"], RES, RES), nodata=fill, compress="deflate",
+                predictor=2 if np.dtype(dtype).kind in "ui" else 3, tiled=True, blockxsize=256, blockysize=256, sparse_ok=True)
+    blocks = [(r0, c0) for r0 in range(0, H, BLOCK) for c0 in range(0, W, BLOCK)
+              if inside[r0:r0 + BLOCK, c0:c0 + BLOCK].any()]
+    lock = threading.Lock()
+    with rasterio.open(tmp, "w", **prof) as dst:
+        def one(rc: tuple[int, int]) -> None:
+            r0, c0 = rc
             h, w = min(BLOCK, H - r0), min(BLOCK, W - c0)
-            if inside is not None and not inside[r0:r0 + h, c0:c0 + w].any():
-                continue
             req = {"expression": img, "fileFormat": "NUMPY_NDARRAY",
                    "grid": {"dimensions": {"width": w, "height": h}, "crsCode": grid["crs"],
                             "affineTransform": {"scaleX": RES, "shearX": 0, "translateX": grid["x0"] + c0 * RES,
@@ -83,11 +95,19 @@ def fetch(image: ee.Image, bands: list[str], dtype: str, fill: float, grid: dict
                     if attempt == 5:
                         raise
                     time.sleep(2 ** attempt + np.random.rand())
-            for i, b in enumerate(bands):
-                out[i, r0:r0 + h, c0:c0 + w] = arr[b]
-    if np.isnan(fill):
-        out[out == send] = np.nan
-    return out
+            block = np.stack([arr[b] for b in bands]).astype(dtype)
+            if np.isnan(fill):
+                block[block == send] = np.nan
+            if job["sensor"] == "s1":
+                block[:, ~inside[r0:r0 + h, c0:c0 + w]] = fill
+            with lock:                                 # one writer at a time
+                dst.write(block, window=rasterio.windows.Window(c0, r0, w, h))
+
+        with ThreadPoolExecutor(threads) as ex:
+            list(ex.map(one, blocks))
+        dst.descriptions = tuple(bands)
+        dst.update_tags(scenes=",".join(job["ids"]))
+    tmp.replace(job["out"])
 
 
 def write_tif(path: Path, arr: np.ndarray, bands: list[str], nodata: float, grid: dict, tags: dict) -> None:
@@ -138,7 +158,7 @@ def s2_jobs(cfg: dict, box: ee.Geometry, raw: Path) -> list[dict]:
         for day in sorted({i[:8] for i in ids}):
             same = [i for i in ids if i[:8] == day]
             score = ee.ImageCollection([cs.filter(ee.Filter.eq("system:index", i)).first() for i in same]).mosaic()
-            clear[day] = score.select("cs_cdf").gte(0.6).reduceRegion(ee.Reducer.mean(), box, 100).get("cs_cdf").getInfo() or 0
+            clear[day] = score.select("cs_cdf").gte(0.6).unmask(0).reduceRegion(ee.Reducer.mean(), box, 100).get("cs_cdf").getInfo() or 0
         log.info("report %s: clear share of the area per Sentinel-2 date %s", report, {k: round(v, 2) for k, v in clear.items()})
         day = max(clear, key=lambda k: (round(clear[k], 2), -abs((pd.Timestamp(k) - d).days)))
         if cfg.get("s2_exact_report_dates") and d.strftime("%Y%m%d") in clear:
@@ -159,7 +179,7 @@ def s2_range_jobs(cfg: dict, box: ee.Geometry, raw: Path, start: str, end: str) 
     def clear_share(day: str) -> float:
         same = [i for i in ids if i[:8] == day]
         score = ee.ImageCollection([cs.filter(ee.Filter.eq("system:index", i)).first() for i in same]).mosaic()
-        return score.select("cs_cdf").gte(0.6).reduceRegion(ee.Reducer.mean(), box, 100).get("cs_cdf").getInfo() or 0
+        return score.select("cs_cdf").gte(0.6).unmask(0).reduceRegion(ee.Reducer.mean(), box, 100).get("cs_cdf").getInfo() or 0
 
     days = sorted({i[:8] for i in ids})
     with ThreadPoolExecutor(min(len(days), 16)) as ex:
@@ -171,7 +191,11 @@ def s2_range_jobs(cfg: dict, box: ee.Geometry, raw: Path, start: str, end: str) 
 
 
 def run(job: dict, grid: dict, inside: np.ndarray) -> dict:
+    """Fetch one image into its file (skipped when the file exists: resume)."""
     t0 = time.time()
+    if job["out"].with_suffix(".tmp").exists():        # another download process is writing this file right now
+        log.info("skip %s: being written by another process", job["out"].name)
+        return {"sensor": job["sensor"], "date": job["date"], "file": job["out"].name, "mb": 0, "seconds": 0}
     if not job["out"].exists():
         if job["sensor"] == "s1":
             img = ee.ImageCollection([ee.Image(f"COPERNICUS/S1_GRD/{i}") for i in job["ids"]]).mosaic()
@@ -183,12 +207,7 @@ def run(job: dict, grid: dict, inside: np.ndarray) -> dict:
                 ee.Image(f"COPERNICUS/S2_SR_HARMONIZED/{i}").addBands(
                     cs.filter(ee.Filter.eq("system:index", i)).first().select("cs_cdf").multiply(100))
                 for i in job["ids"]]).mosaic().toUint16()
-        # SAR is kept only inside the crop mask. The optical check image stays whole: it is only looked at,
-        # and the surroundings help the eye.
-        arr = fetch(img, job["bands"], job["dtype"], job["fill"], grid, inside)
-        if job["sensor"] == "s1":
-            arr[:, ~inside] = job["fill"]
-        write_tif(job["out"], arr, job["bands"], job["fill"], grid, {"scenes": ",".join(job["ids"])})
+        fetch_to_file(img, job, grid, inside, job.get("block_threads", 1))
     row = {k: v for k, v in job.items() if k in ("sensor", "date", "track", "satellite", "report", "clear_share")}
     return {**row, "file": job["out"].name, "mb": round(job["out"].stat().st_size / 1e6, 1), "seconds": round(time.time() - t0, 1)}
 
@@ -203,21 +222,31 @@ def main(area_file: str, cfg_path: str = "configs/config.yaml", s2_start: str = 
     grid = make_grid(area_file, cfg["crs"]["work"])
     box = ee.Geometry.Rectangle(list(gpd.read_file(area_file).to_crs(4326).total_bounds))
     raw = Path(cfg["paths"]["raw"])
-    inside = cane_mask(grid, cfg, Path(cfg["paths"]["interim"]) / f"{cfg['aoi']}_cane_mask_{Path(area_file).stem.split('_', 1)[-1]}.tif")
+    mask_file = Path(cfg["paths"]["interim"]) / f"{cfg['aoi']}_cane_mask_{Path(area_file).stem.split('_', 1)[-1]}.tif"
+    if mask_file.exists():                             # same mask on a re-run (resume)
+        with rasterio.open(mask_file) as r:
+            inside = r.read(1) == 1
+    else:
+        inside = cane_mask(grid, cfg, mask_file)
     for sub in ("s1", "s2"):
         (raw / sub).mkdir(parents=True, exist_ok=True)
     # Extra optical dates only when a range is given; the SAR job list is always complete (finished files are skipped).
-    jobs = s1_jobs(cfg, box, raw) + (s2_range_jobs(cfg, box, raw, s2_start, s2_end) if s2_start else s2_jobs(cfg, box, raw))
-    # Network-bound work: more threads than cores is fine; memory per file is small (one image in RAM).
-    per_file_gb = grid["width"] * grid["height"] * 12 / 1e9 + 0.2          # one whole-grid array in RAM per file (6 x uint16 at most)
-    n = min(len(jobs), 20, max(1, workers(mem_per_worker_gb=per_file_gb, keep_free_cores=0)) * 3)
+    optical = [] if not cfg.get("s2", True) else (s2_range_jobs(cfg, box, raw, s2_start, s2_end) if s2_start else s2_jobs(cfg, box, raw))
+    jobs = [j for j in s1_jobs(cfg, box, raw) + optical if not j["out"].exists()]
+    # Network-bound: Earth Engine serves about 40 requests at once, so files x blocks-per-file stays near 40.
+    # Few files at a time, oldest first: early report dates can start while later passes still download.
+    jobs.sort(key=lambda j: (j["sensor"] != "s1", j["date"]), reverse=bool(cfg.get("download_newest_first")))
+    n = max(1, min(len(jobs), int(cfg.get("download_files_at_once", 20))))
+    for j in jobs:
+        j["block_threads"] = max(1, int(cfg.get("download_concurrency", 40)) // n)
     log.info("crop mask inside the grid: %.1f acres (%.0f%% of the pixels)", inside.sum() * RES * RES / 4046.8564224, 100 * inside.mean())
-    log.info("grid %d x %d px; %d files to fetch with %d threads", grid["width"], grid["height"], len(jobs), n)
+    log.info("grid %d x %d px; %d files to fetch, %d at a time, %d blocks each at a time", grid["width"], grid["height"], len(jobs), n,
+             jobs[0]["block_threads"] if jobs else 0)
     t0 = time.time()
     with ThreadPoolExecutor(n) as ex:
         rows = list(ex.map(lambda j: run(j, grid, inside), jobs))
     out = Path(cfg["paths"]["interim"]) / f"{Path(area_file).stem}_download_manifest{'_s2_extra' if s2_start else ''}.csv"
-    df = pd.DataFrame(rows).sort_values(["sensor", "date"])
+    df = pd.DataFrame(rows, columns=["sensor", "date", "file", "mb", "seconds"] if not rows else None).sort_values(["sensor", "date"])
     df.to_csv(out, index=False)
     log.info("done: %d files, %.0f MB, %.0f s wall; manifest %s", len(df), df.mb.sum(), time.time() - t0, out)
 

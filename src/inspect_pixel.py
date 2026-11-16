@@ -49,7 +49,18 @@ def main(lon: str, lat: str, area: str = "full", cfg_path: str = "configs/config
             if f.exists():
                 with rasterio.open(f) as r:
                     line.append(f"{name}: {CLASS[int(r.read(1, window=Window(col, row, 1, 1))[0, 0])]}")
-        print("  " + " | ".join(line))
+        # Areas without original reports (e.g. a new mill): our result and the model's harvest probability
+        new = Path("outputs") / f"{cfg['aoi']}_{area}"
+        h, pr = new / f"{cfg['aoi']}_{area}_sar_harvest_{r_date}_v1.tif", new / f"{cfg['aoi']}_{area}_sar_probability_{r_date}_v1.tif"
+        if h.exists():
+            with rasterio.open(h) as r:
+                v = int(r.read(1, window=Window(col, row, 1, 1))[0, 0])
+            line.append("SAR: " + {81: "standing (81)", 82: "harvested (82)"}.get(v, "outside the crop mask"))
+            if pr.exists():
+                with rasterio.open(pr) as r:
+                    q = int(r.read(1, window=Window(col, row, 1, 1))[0, 0])
+                line.append(f"harvest probability {q} %" if q <= 100 else "")
+        print("  " + " | ".join(x for x in line if x))
 
     rows = []
     for track, direction in cfg["s1_tracks"].items():
