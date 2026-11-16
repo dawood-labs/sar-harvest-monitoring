@@ -5,6 +5,7 @@ Reads straight from the rasters (no big cache): the pixel itself and the mean of
 lie inside the crop mask.
 
 Usage: python src/inspect_pixel.py <lon> <lat> [area_name] [config.yaml]      (copy lon / lat from QGIS, EPSG:4326)
+       or open notebooks/inspect_places.ipynb, paste coordinates and run it.
 Output: a table on screen and reports/figures/<aoi>_<area>_pixel_<lon>_<lat>.png
 """
 from __future__ import annotations
@@ -26,14 +27,15 @@ CLASS = {0: "outside the crop mask / no original answer", 1: "both standing", 2:
          3: "original harvested, ours standing", 4: "original standing, ours harvested"}
 
 
-def main(lon: str, lat: str, area: str = "full", cfg_path: str = "configs/config_full.yaml") -> None:
+def main(lon: str, lat: str, area: str = "full", cfg_path: str = "configs/config_full.yaml") -> Path | None:
     cfg = yaml.safe_load(open(cfg_path))
     raw, interim, out = Path(cfg["paths"]["raw"]), Path(cfg["paths"]["interim"]), Path("outputs") / area
     with rasterio.open(interim / f"{cfg['aoi']}_cane_mask_{area}.tif") as r:
         x, y = Transformer.from_crs(4326, r.crs, always_xy=True).transform(float(lon), float(lat))
         row, col = r.index(x, y)
         if not (0 <= row < r.height and 0 <= col < r.width):
-            sys.exit("This point is outside the area.")
+            print(f"lon {lon}, lat {lat}: this point is outside the area.")
+            return None
         win = Window(max(col - 2, 0), max(row - 2, 0), 5, 5)
         mask = r.read(1, window=win) == 1
         inside = r.read(1, window=Window(col, row, 1, 1))[0, 0] == 1
@@ -87,6 +89,7 @@ def main(lon: str, lat: str, area: str = "full", cfg_path: str = "configs/config
     p = Path("reports/figures") / f"{cfg['aoi']}_{area}_pixel_{lon}_{lat}.png"
     fig.savefig(p); plt.close(fig)
     print("figure:", p)
+    return p
 
 
 if __name__ == "__main__":
