@@ -33,20 +33,36 @@ Steps
      Pieces below 0.01 m2 (numerical noise) are always removed.
   6. Drop slivers smaller than --min-acres. Output: EPSG:4326, fields predicted (81), area_ac.
 
-How it scales: the machine (cores, free memory) is read first, a memory budget (available
-memory minus a 1.5-2 GB buffer) fixes the number of workers and the tile size, and the raster
-is processed tile by tile (window reads only, one-cell halo for the filter). Finished tiles are
-saved in <output stem>_work/ so an interrupted run resumes where it stopped; each stage deletes
-its inputs only after its own result is saved, and the output is written under a temporary name
-and swapped in at the end. Shapefile output is limited to 2 GB by the format; use .gpkg for very
-large results. The work folder holds a marker file; the script only ever deletes its own files.
+How it scales: the machine (cores, free memory) is read first. Memory budget = available memory
+minus a buffer of 20 % of it (at least 0.5 GB, at most 1 GB); --max-memory-gb / --memory-buffer-gb
+override. Memory mode (printed in the plan line): "container" when a cgroup memory limit or
+MEM_GUARANTEE is set - strict planning (2 x the measured worst case per cell), new tiles wait while
+free memory is below the buffer, because going over the limit kills the run; "desktop" (Windows,
+macOS, plain Linux) - the measured memory plus a modest margin, new tiles wait only below 0.3 GB free
+and never long, because a shortage there means paging; a rare heavy tile is split in 4 and retried.
+Layout: P worker processes x T threads (P x T = parallel tiles, all cores by default). Every process
+costs about 200 MB of its own, so as many processes as the budget comfortably holds are used and the
+remaining cores run as threads (down to 1 process x N threads = threads inside this program, nothing
+spawned, on small budgets). Every thread opens the raster and its part of L1 itself. --workers sets
+the number of parallel tiles; --processes / --threads fix the layout. The raster is processed tile by
+tile (window reads only, one-cell halo for the filter). Finished tiles are saved in
+<output stem>_work/ so an interrupted run resumes where it stopped; each stage deletes its inputs only
+after its own result is saved, and the output is written under a temporary name and swapped in at the
+end. The prepared L1 (reprojected, repaired) is kept in a cache folder in the user's home
+(.preprocess_classified/l1_prepared, at most 2 GB, least recently used first out; only files this
+tool created are deleted) so the next report date with the same L1 skips that step. Shapefile output
+is limited to 2 GB by the format; use .gpkg for very large results. The work folder holds a marker
+file; the script only ever deletes its own files. The end of a run prints a RESULT block; add
+--summary-line for the old one-line "SUMMARY key=value" output for scripts.
 
 Run without arguments (or with --ask) for a question-and-answer mode; all choices are also
 available as flags for unattended runs:
     python preprocess_classified.py --raster in.tif --l1 l1.shp --out out.shp [--min-acres 0.2]
         [--utm 47N | EPSG:32647] [--allow-non-utm] [--assume-l1-crs] [--cane-value 1]
-        [--workers N] [--keep-slivers] [--no-filter] [--neighbors 4|8]
-        [--majority-threshold majority|half] [--max-memory-gb G] [--tile-size T] [--clean]
+        [--workers N] [--processes P] [--threads T] [--memory-mode auto|desktop|container]
+        [--keep-slivers] [--no-filter] [--neighbors 4|8] [--majority-threshold majority|half]
+        [--max-memory-gb G] [--memory-buffer-gb G] [--tile-size T] [--clean] [--summary-line]
+In question mode the output is asked as folder, name and format (1 shapefile, 2 GeoPackage).
 """
 import argparse
 import hashlib
@@ -60,10 +76,12 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
+import traceback
+import warnings
 from collections import deque
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
-from concurrent.futures.process import BrokenProcessPool
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, wait
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -88,13 +106,20 @@ from shapely import STRtree  # noqa: E402
 
 if int(shapely.__version__.split(".")[0]) < 2:
     sys.exit("ERROR: shapely >= 2.0 is required (pip install -U shapely)")
+# polygonising an in-memory mask has no georeference by design (global filter: thread-safe)
+warnings.filterwarnings("ignore", category=rasterio.errors.NotGeoreferencedWarning)
 
 CACHE_VERSION = 5                     # bump whenever saved tiles/merge results change meaning
 ACRE_M2 = 4046.85642
 PREDICTED = 81
+FINAL_GROUP_BYTES = 32 * 1024 ** 2   # final stage works on groups of about this much WKB (main process memory)
+SHP_WARN_BYTES = int(1.5 * 1024 ** 3)  # estimated result size above which a shapefile output gets a NOTE
 NOISE_M2 = 0.01                       # pieces below this area are numerical noise, always dropped
 BLOCK = int(os.environ.get("PREPROCESS_TEST_BLOCK", 512))   # largest block polygonised in one call (cells)
-WORKER_BASE_BYTES = 200 * 1024 ** 2   # python + libraries per worker process
+WORKER_BASE_BYTES = 200 * 1024 ** 2   # python + libraries per worker process (measured: about 175 MB)
+TASK_BASE_BYTES = 32 * 1024 ** 2      # per tile task besides its cells: L1 part, trees, buffers
+DESKTOP_HOLD_BYTES = int(0.3 * 1024 ** 3)   # desktop mode: hold new tasks only below this much free memory
+DESKTOP_HOLD_MAX_S = 10.0             # ... and never longer than this per task
 MARKER = "preprocess_classified.workfolder"
 LOCK = "run.lock"
 SHP_SIDECARS = (".shp", ".shx", ".dbf", ".prj", ".cpg", ".sbn", ".sbx", ".qix", ".fbn", ".fbx",
@@ -116,10 +141,59 @@ class DiskSpaceError(UserError):
     pass
 
 
+class TileStopped(Exception):
+    """Raised inside a tile task when the run is being stopped (Ctrl+C)."""
+
+
+_STOP = threading.Event()   # set when the run stops: tile threads of this process end at the next block
+
+
 def tick(msg):
+    """Print a progress line with the seconds since the previous one; returns those seconds."""
     now = time.time()
-    print(f"[{now - _T0[0]:7.1f}s] {msg}", flush=True)
+    dt = now - _T0[0]
+    print(f"[{dt:7.1f}s] {msg}", flush=True)
     _T0[0] = now
+    return dt
+
+
+def print_result_block(title, sections):
+    """Print a titled block (ASCII, aligned). sections = [(heading, rows)]; a row is a tuple of strings.
+    Rows with 2+ cells are aligned in columns (first cell left, the next two right-aligned, any further
+    cell left as free text); a row with one cell is printed as it is. An empty heading prints no
+    heading line. Shared look for the end-of-run summary of the tools in this folder."""
+    wid = [0, 0, 0]
+    for _, rows in sections:
+        for r in rows:
+            if len(r) > 1:
+                for i in range(min(len(r), 3)):
+                    wid[i] = max(wid[i], len(r[i]))
+    lines = []
+    for heading, rows in sections:
+        if lines:
+            lines.append("")
+        if heading:
+            lines.append(heading)
+        for r in rows:
+            if len(r) == 1:
+                lines.append(r[0])
+                continue
+            cells = [r[0].ljust(wid[0])] + [c.rjust(wid[i]) for i, c in enumerate(r[1:3], 1)]
+            line = "  ".join(cells) + "".join("  " + c for c in r[3:])
+            lines.append(line.rstrip())
+    width = max([48] + [len(x) for x in lines if len(x) <= 90])
+    head = f" {title} "
+    print("=" * ((width - len(head)) // 2) + head + "=" * (width - len(head) - (width - len(head)) // 2))
+    print("\n".join(lines))
+    print("=" * width, flush=True)
+
+
+def human_size(n):
+    """1,234 B / 12.3 KB / 72.5 MB / 1.2 GB"""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:,.0f} {unit}" if unit == "B" else f"{n:,.1f} {unit}"
+        n /= 1024
 
 
 # ---------------------------------------------------------------- machine
@@ -222,11 +296,33 @@ def available_memory():
     return memory_status()[0]
 
 
-def memory_buffer_bytes(total, buffer_gb=None):
-    """Memory kept free for other programs: 2 GB (1.5 GB on machines with 8 GB RAM or less)."""
+def memory_buffer_bytes(total, buffer_gb=None, available=None):
+    """Memory kept free for other programs: 20 % of the available memory, at least 0.5 GB and at
+    most 1 GB (2.5 GB free -> 0.5, 12 GB free -> 1.0). `total` is kept for callers of the old rule."""
     if buffer_gb is not None:
         return int(buffer_gb * 1024 ** 3)
-    return int((1.5 if total and total <= 8 * 1024 ** 3 + 1024 ** 2 else 2.0) * 1024 ** 3)
+    if available is None:
+        available = available_memory()
+    return int(min(max(0.2 * available, 0.5 * 1024 ** 3), 1.0 * 1024 ** 3))
+
+
+def memory_mode():
+    """'container' when a cgroup memory limit or MEM_GUARANTEE is set (going over it gets the run
+    killed: strict planning), else 'desktop' (Windows, macOS, plain Linux: a shortage means paging,
+    so planning is more lenient). PREPROCESS_MEMORY_MODE=desktop|container overrides."""
+    forced = os.environ.get("PREPROCESS_MEMORY_MODE", "").strip().lower()
+    if forced in ("desktop", "container"):
+        return forced
+    if os.environ.get("MEM_GUARANTEE", "").strip():
+        return "container"
+    if os.name == "nt" or sys.platform == "darwin":
+        return "desktop"
+    for p in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.high",
+              "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        v = _read_int(p)
+        if v is not None and v < 1 << 50:
+            return "container"
+    return "desktop"
 
 
 def _pid_alive(pid):
@@ -637,17 +733,153 @@ def load_l1(path, crs, bbox=None, workers=1, trusted=False):
     return polys_only(g) if len(g) else g
 
 
-def prepare_l1(l1_path, raster_crs, work, workers):
-    """Read L1 once, reproject to the raster CRS, make it valid (parallel) and save it as
-    <work>/l1_valid.gpkg (spatially indexed) so that tiles can read only their own part."""
+def _valid_l1_wkb(l1_path, crs, workers=1):
+    """WKB of polys_only(load_l1(l1_path, crs)) - the same polygons in the same order - without the
+    serial to_wkb round trip for rows that are already valid single polygons (their source WKB is
+    passed through when no reprojection is needed)."""
+    meta, _, wkb, _ = pyogrio.raw.read(str(l1_path), read_geometry=True, columns=[])
+    if len(wkb) == 0:
+        return np.array([], dtype=object)
+    g = shapely.from_wkb(wkb)
+    keep = ~shapely.is_missing(g)
+    keep[keep] = ~shapely.is_empty(g[keep])
+    g, wkb = g[keep], wkb[keep]
+    lcrs = meta.get("crs")
+    if len(g) == 0:
+        return np.array([], dtype=object)
+    if lcrs and pyproj.CRS(lcrs) != pyproj.CRS(crs):
+        return to_wkb(load_l1(l1_path, crs, workers=workers))
+    with ThreadPoolExecutor(max(1, workers)) as ex:
+        ok = np.concatenate(list(ex.map(lambda i: shapely.is_valid(g[i]), _chunks(len(g), workers))))
+        bad = np.flatnonzero(~ok)
+        if len(bad):
+            fixed = ex.map(lambda i: shapely.make_valid(g[bad[i]]), _chunks(len(bad), workers, 16))
+            g[bad] = np.concatenate(list(fixed))
+    simple = ok & (shapely.get_type_id(g) == 3)
+    if simple.all():
+        return wkb
+    rows = np.flatnonzero(~simple)
+    p1, i1 = shapely.get_parts(g[rows], return_index=True)
+    p2, i2 = shapely.get_parts(p1, return_index=True)
+    sel = (shapely.get_type_id(p2) == 3) & ~shapely.is_empty(p2)
+    parts, prow = p2[sel], i1[i2][sel]                       # parts in row order, row = index into rows
+    counts = np.ones(len(g), dtype=np.int64)
+    counts[rows] = np.bincount(prow, minlength=len(rows))
+    starts = np.cumsum(counts) - counts
+    out = np.empty(int(counts.sum()), dtype=object)
+    out[starts[simple]] = wkb[simple]
+    first = np.searchsorted(prow, prow)                       # rank of each part within its row
+    out[starts[rows[prow]] + (np.arange(len(prow)) - first)] = to_wkb(parts)
+    return out
+
+
+L1_CACHE_DIR = Path.home() / ".preprocess_classified" / "l1_prepared"
+L1_CACHE_MARKER = "preprocess_classified.l1cache"
+L1_CACHE_INDEX = "index.json"
+L1_CACHE_RE = re.compile(r"^l1v_[0-9a-f]{16}(\.\d+\.tmp)?\.gpkg(-wal|-shm|-journal)?$")
+
+
+def l1_cache_cap_bytes():
+    try:
+        return int(float(os.environ.get("PREPROCESS_L1_CACHE_GB", "2")) * 1024 ** 3)
+    except ValueError:
+        return 2 * 1024 ** 3
+
+
+def l1_cache_key(l1_path, raster_crs):
+    return _hash({"v": CACHE_VERSION, "kind": "l1_prepared", "l1": _file_sig(l1_path, "l1"),
+                  "crs": pyproj.CRS(raster_crs).to_wkt()})
+
+
+def _l1_cache_dir():
+    """The cache folder (created with a marker); None when it cannot be used."""
+    d = L1_CACHE_DIR
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        m = d / L1_CACHE_MARKER
+        if not m.exists():
+            if any(True for _ in d.iterdir()):
+                return None   # a folder of that name that this tool did not make: leave it alone
+            m.write_text("prepared L1 layers of preprocess_classified.py; safe to delete when no run is active\n")
+        return d if folder_writable(d) else None
+    except OSError:
+        return None
+
+
+def _l1_cache_index(d):
+    try:
+        return json.loads((d / L1_CACHE_INDEX).read_text()).get("files", {})
+    except Exception:
+        return {}
+
+
+def _l1_cache_evict(d, index, keep_name):
+    """Delete least recently used prepared layers above the size cap; only files this tool
+    created (listed in its index, matching its own name pattern) are ever deleted."""
+    cap = l1_cache_cap_bytes()
+    names = [n for n in index if L1_CACHE_RE.match(n) and (d / n).exists()]
+    total = sum((d / n).stat().st_size for n in names)
+    for n in sorted(names, key=lambda n: index[n].get("used", 0)):
+        if total <= cap:
+            break
+        if n == keep_name or time.time() - index[n].get("used", 0) < 3600:
+            continue   # in use now, or used within the last hour (perhaps by another run)
+        try:
+            size = (d / n).stat().st_size
+            (d / n).unlink()
+            total -= size
+            index.pop(n, None)
+        except OSError:
+            pass       # open in another run (Windows): try again next time
+    for n in list(index):
+        if not (d / n).exists():
+            index.pop(n, None)
+
+
+def prepare_l1(l1_path, raster_crs, work, workers, cache=True):
+    """Read L1 once, reproject to the raster CRS, make it valid (parallel) and save it spatially
+    indexed so that tiles read only their own part. The prepared layer is cached between runs in
+    L1_CACHE_DIR (key: L1 file signature + raster CRS), so later report dates with the same L1
+    skip this step; without a usable cache folder it goes to <work>/l1_valid.gpkg as before."""
     dst = Path(work) / "l1_valid.gpkg"
     if dst.exists():
         return dst
-    g = load_l1(l1_path, raster_crs, workers=workers)
+    d = _l1_cache_dir() if cache else None
+    name = f"l1v_{l1_cache_key(l1_path, raster_crs)}.gpkg" if d else None
+    if d is not None and (d / name).exists():
+        try:
+            index = _l1_cache_index(d)
+            index.setdefault(name, {"size": (d / name).stat().st_size, "l1": str(Path(l1_path).resolve())})
+            index[name]["used"] = time.time()
+            _write_json(d / L1_CACHE_INDEX, {"files": index})
+        except OSError:
+            pass
+        return d / name
+    w = _valid_l1_wkb(l1_path, raster_crs, workers)
+    if d is not None:
+        tmp = d / f"{name[:-5]}.{os.getpid()}.tmp.gpkg"
+        try:
+            if tmp.exists():
+                tmp.unlink()
+            pyogrio.raw.write(str(tmp), geometry=w, field_data=[], fields=[], geometry_type="Polygon",
+                              crs=pyproj.CRS(raster_crs).to_wkt(), driver="GPKG", layer="l1")
+            os.replace(tmp, d / name)
+            index = _l1_cache_index(d)
+            index[name] = {"size": (d / name).stat().st_size, "used": time.time(), "l1": str(Path(l1_path).resolve())}
+            _l1_cache_evict(d, index, name)
+            _write_json(d / L1_CACHE_INDEX, {"files": index})
+            return d / name
+        except OSError:
+            for q in (tmp, Path(str(tmp) + "-wal"), Path(str(tmp) + "-shm")):
+                try:
+                    if q.exists():
+                        q.unlink()
+                except OSError:
+                    pass
     tmp = Path(work) / "l1_valid.tmp.gpkg"
     if tmp.exists():
         tmp.unlink()
-    pyogrio.raw.write(str(tmp), geometry=to_wkb(g), field_data=[], fields=[], geometry_type="Polygon",
+    pyogrio.raw.write(str(tmp), geometry=w, field_data=[], fields=[], geometry_type="Polygon",
                       crs=pyproj.CRS(raster_crs).to_wkt(), driver="GPKG", layer="l1")
     os.replace(tmp, dst)
     return dst
@@ -669,20 +901,41 @@ def clip_pieces(comps, l1, tree):
     ci, li = ci[order], li[order]
     cuts, starts = np.unique(ci, return_index=True)
     ends = np.append(starts[1:], len(ci))
-    res = []
-    for c, s, e in zip(cuts, starts, ends):
-        if done[c]:
-            continue
+    keep = ~done[cuts]
+    cuts, starts, ends = cuts[keep], starts[keep], ends[keep]
+    if len(cuts):
+        out.append(polys_only(_clip_batch(comps, l1, li, cuts, starts, ends)))
+    return np.concatenate(out)
+
+
+def _clip_batch(comps, l1, li, cuts, starts, ends):
+    """intersection(comp, union of its L1 candidates) for many components in two array calls
+    (fewer interpreter round trips: threads scale better). Same GEOS operations, same results."""
+    n = ends - starts
+    U = np.empty(len(cuts), dtype=object)
+    one = n == 1
+    U[one] = l1[li[starts[one]]]
+    multi = np.flatnonzero(~one)
+    try:
+        if len(multi):
+            m = int(n[multi].max())
+            A = np.full((len(multi), m), None, dtype=object)
+            for k, j in enumerate(multi):
+                A[k, :n[j]] = l1[li[starts[j]:ends[j]]]
+            U[multi] = shapely.union_all(A, axis=1)
+        return shapely.intersection(comps[cuts], U)
+    except shapely.errors.GEOSException:
+        pass
+    res = np.empty(len(cuts), dtype=object)
+    for k, (c, s, e) in enumerate(zip(cuts, starts, ends)):   # one by one, repairing what GEOS rejects
         cand = l1[li[s:e]]
         try:
             u = cand[0] if len(cand) == 1 else shapely.union_all(cand)
-            res.append(shapely.intersection(comps[c], u))
+            res[k] = shapely.intersection(comps[c], u)
         except shapely.errors.GEOSException:
             u = shapely.union_all(shapely.make_valid(cand))
-            res.append(shapely.intersection(shapely.make_valid(comps[c]), u))
-    if res:
-        out.append(polys_only(np.array(res, dtype=object)))
-    return np.concatenate(out)
+            res[k] = shapely.intersection(shapely.make_valid(comps[c]), u)
+    return res
 
 
 def clip_to_l1(comps, l1, workers=1):
@@ -748,16 +1001,20 @@ def _clean_crossings(polys, tf, protected):
         rm[k] = np.array([(a, b) not in protected for a, b in xy[k]], dtype=bool)
     if not rm.any():
         return polys
+    # rebuild all affected polygons in one vectorised call (a ring keeps all its vertices when
+    # fewer than 3 would remain); linear in the number of vertices, also for polygons with many holes
+    nring = len(rings)
+    ring_ok = np.bincount(ridx[~rm], minlength=nring) >= 3
+    aff = np.unique(pidx[ridx[rm]])
+    ring_aff = np.zeros(nring, dtype=bool)
+    ring_aff[np.isin(pidx, aff)] = True
+    sel = ring_aff[ridx] & (~rm | ~ring_ok[ridx])
+    rid = ridx[sel]
+    uring, rnew = np.unique(rid, return_inverse=True)
+    lr = shapely.linearrings(xy[sel], indices=rnew)
+    _, pnew = np.unique(pidx[uring], return_inverse=True)
     out = polys.copy()
-    ring_poly = pidx
-    for pi in np.unique(ring_poly[ridx[rm]]):
-        rids = np.flatnonzero(ring_poly == pi)
-        new = []
-        for r in rids:
-            sel = ridx == r
-            keep = sel & ~rm
-            new.append(xy[keep] if keep.sum() >= 3 else xy[sel])
-        out[pi] = shapely.Polygon(new[0], new[1:])
+    out[aff] = shapely.polygons(lr, indices=pnew)
     return out
 
 
@@ -958,6 +1215,8 @@ def tile_pieces(src, win, p, l1):
     fin, seam = [], []
     for i in range(len(rl) - 1):
         for j in range(len(cl) - 1):
+            if _STOP.is_set():
+                raise TileStopped()
             bw = (rl[i], cl[j], rl[i + 1], cl[j + 1])
             sub = cane[bw[0] - r0:bw[2] - r0, bw[1] - c0:bw[3] - c0]
             if not sub.any():
@@ -1020,8 +1279,8 @@ def _process_tile(task):
     fails = os.environ.get("PREPROCESS_TEST_MEMFAIL", "").split(",")
     if win_name(win) in fails:
         raise MemoryError("injected test failure")
-    if "kill:" + win_name(win) in fails:
-        os._exit(9)   # test hook: simulate a worker killed by the system
+    if "kill:" + win_name(win) in fails and multiprocessing.parent_process() is not None:
+        os._exit(9)   # test hook: simulate a worker process killed by the system
     tiles_dir = task["tiles_dir"]
     if not task["has_l1"]:
         _empty_result(tiles_dir, win)
@@ -1102,6 +1361,75 @@ def make_plan(rows, cols, budget, cores, bpc, workers=None, tile=None):
         t = int(tile)
     t = max(2, min(t, max(rows, cols)))
     return w, t, bpc
+
+
+def plan_bpc(bpc, mode="container"):
+    """Bytes per tile cell used for planning: container = 2 x the probe (worst case, a kill costs
+    the run); desktop = the probe plus a modest margin (a shortage only means paging)."""
+    return max(2.0 * bpc, 24.0) if mode == "container" else max(1.25 * bpc, 16.0)
+
+
+def thread_task_bytes(t, bpc_plan):
+    """Memory of one tile task (no process base): L1 part, trees, buffers + tile cells."""
+    return TASK_BASE_BYTES + t * t * bpc_plan
+
+
+def choose_layout(total, fit_procs, cores):
+    """(processes, threads) for `total` parallel tasks when at most fit_procs processes fit.
+    Processes scale best, so as many as fit; the rest of the tasks run as threads. 1 process
+    means: threads inside this program (nothing is spawned)."""
+    total = max(1, total)
+    best = (1, total)
+    hi = max(1, min(total, fit_procs, 30 if os.name == "nt" else total))   # Windows: 2 wait handles each, 64 max
+    lo = max(1, hi // 2)
+    best_used = -1
+    for p in range(hi, lo - 1, -1):
+        t = max(1, total // p)
+        used = p * t
+        if used > best_used:
+            best, best_used = (p, t), used
+    return (1, total) if best[0] == 1 else best
+
+
+def plan_layout(rows, cols, budget, cores, bpc_plan, workers=None, tile=None, processes=None, threads=None):
+    """Tile size and layout. Returns (processes, threads, tile edge, total parallel tasks).
+
+    total tasks = --workers (or processes x threads, or all cores); the tile is as large as allows a
+    few tiles per task, shrunk until all tasks fit the budget as threads of ONE process; then as
+    many worker processes as the rest of the budget holds (WORKER_BASE_BYTES each)."""
+    if processes and threads:
+        total = processes * threads
+    elif workers:
+        total = workers
+    elif processes:
+        total = processes * max(1, cores // processes)
+    elif threads:
+        total = threads * max(1, cores // threads)
+    else:
+        total = cores
+    total = max(1, total)
+    if tile is None:
+        t = min(4096, max(128, int(math.sqrt(rows * cols / (3 * total)))))   # a few tiles per task
+        t = max(t, min(256, max(rows, cols)))
+        while t > 256 and total * thread_task_bytes(t, bpc_plan) > budget:
+            t = max(256, int(t * 0.9))
+        if not (workers or processes or threads):
+            while total > 1 and total * thread_task_bytes(t, bpc_plan) > budget:
+                total -= 1
+    else:
+        t = int(tile)
+    t = max(2, min(t, max(rows, cols)))
+    fit = int(max(0, budget - total * thread_task_bytes(t, bpc_plan)) // WORKER_BASE_BYTES)
+    if processes and threads:
+        p, th = processes, threads
+    elif processes:
+        p, th = processes, max(1, -(-total // processes))
+    elif threads:
+        p, th = max(1, -(-total // threads)), threads
+    else:
+        p, th = choose_layout(total, fit if fit >= 2 else 1, max(cores, total))
+        total = min(total, p * th)
+    return p, th, t, total
 
 
 def tile_windows(rows, cols, t):
@@ -1266,10 +1594,196 @@ def _kill_pool(ex):
             pass
 
 
+def _run_task_safe(task):
+    """process_tile for a pool thread: ('done', status) or ('error', text)."""
+    try:
+        return ("done", process_tile(task))
+    except TileStopped:
+        return ("stopped", None)
+    except BaseException as e:   # noqa: B902 - reported to the main program, which stops the run
+        return ("error", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+
+def _pool_worker(conn, threads):
+    """Worker process: `threads` threads take tile tasks from this process's own pipe and send
+    results back on it. Each thread opens its own raster and L1 part (nothing is shared)."""
+    import queue
+    _worker_init()
+    tasks, lock = queue.Queue(), threading.Lock()
+
+    def run():
+        while True:
+            item = tasks.get()
+            if item is None:
+                return
+            tid, task = item
+            kind, val = _run_task_safe(task)
+            with lock:
+                conn.send((kind, tid, val))
+
+    ths = [threading.Thread(target=run, daemon=True) for _ in range(threads)]
+    for t in ths:
+        t.start()
+    try:
+        while True:
+            try:
+                item = conn.recv()
+            except (EOFError, OSError):
+                os._exit(0)
+            if item is None:
+                break
+            tasks.put(item)
+    except KeyboardInterrupt:
+        os._exit(1)
+    for _ in ths:
+        tasks.put(None)
+    for t in ths:
+        t.join()
+
+
+class TilePool:
+    """Runs tile tasks on `procs` spawned worker processes x `threads` threads each.
+
+    procs <= 1: the threads run inside this program (nothing spawned, no pool to rebuild; a tile
+    that fails with MemoryError is split as usual and finished tiles are already on disk).
+    procs > 1: every process has its own pipe, so the tasks lost with a dead process are known
+    exactly and only that process is restarted."""
+
+    def __init__(self, procs, threads, inproc=None):
+        import queue
+        self.inproc = procs <= 1 if inproc is None else bool(inproc)
+        self.threads = max(1, int(threads))
+        self.nproc = 1 if self.inproc else int(procs)
+        self.capacity = self.nproc * self.threads
+        self._tid = 0
+        if self.inproc:
+            _STOP.clear()
+            self._q, self._res = queue.Queue(), queue.Queue()
+            self._ths = [threading.Thread(target=self._thread_main, daemon=True) for _ in range(self.threads)]
+            for t in self._ths:
+                t.start()
+        else:
+            self._ctx = multiprocessing.get_context("spawn")
+            self._slots = [self._start() for _ in range(self.nproc)]
+
+    # ---- in-process threads
+    def _thread_main(self):
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            tid, task = item
+            kind, val = _run_task_safe(task)
+            self._res.put((kind, tid, val))
+
+    # ---- worker processes
+    def _start(self):
+        a, b = self._ctx.Pipe(duplex=True)
+        pr = self._ctx.Process(target=_pool_worker, args=(b, self.threads), daemon=True)
+        pr.start()
+        b.close()
+        return {"proc": pr, "conn": a, "live": set()}
+
+    def submit(self, task):
+        """Queue one task; returns its id (a dead process is reported by wait())."""
+        self._tid += 1
+        tid = self._tid
+        if self.inproc:
+            self._q.put((tid, task))
+            return tid
+        slot = min(self._slots, key=lambda s: len(s["live"]))
+        slot["live"].add(tid)
+        try:
+            slot["conn"].send((tid, task))
+        except (OSError, EOFError):
+            pass   # the process is dead; wait() reports the task as lost
+        return tid
+
+    def wait(self, timeout=2.0):
+        """Events since the last call: ('done', tid, status), ('error', tid, text) and
+        ('lost', [tids], None) for the tasks of a worker process that died."""
+        import queue
+        from multiprocessing.connection import wait as mp_wait
+        ev = []
+        if self.inproc:
+            try:
+                ev.append(self._res.get(timeout=timeout))
+                while True:
+                    ev.append(self._res.get_nowait())
+            except queue.Empty:
+                pass
+            return ev
+        objs = [s["conn"] for s in self._slots] + [s["proc"].sentinel for s in self._slots]
+        ready = mp_wait(objs, timeout)
+        for k, s in enumerate(self._slots):
+            if s["conn"] in ready or s["proc"].sentinel in ready:
+                try:
+                    while s["conn"].poll():
+                        kind, tid, val = s["conn"].recv()
+                        s["live"].discard(tid)
+                        ev.append((kind, tid, val))
+                except (EOFError, OSError):
+                    pass
+            if not s["proc"].is_alive():
+                lost = sorted(s["live"])
+                self._close_slot(s)
+                self._slots[k] = self._start()
+                if lost:
+                    ev.append(("lost", lost, None))
+        return ev
+
+    def _close_slot(self, s):
+        try:
+            s["conn"].close()
+        except Exception:
+            pass
+        pr = s["proc"]
+        try:
+            if pr.is_alive():
+                pr.terminate()
+            pr.join(5)
+        except Exception:
+            pass
+
+    def close(self):
+        """Stop everything now (also used on Ctrl+C and errors)."""
+        if self.inproc:
+            _STOP.set()
+            for _ in self._ths:
+                self._q.put(None)
+            end = time.time() + 5
+            for t in self._ths:
+                t.join(max(0.0, end - time.time()))
+            _STOP.clear()
+            return
+        for s in self._slots:
+            try:
+                s["conn"].send(None)
+            except Exception:
+                pass
+        for s in self._slots:
+            self._close_slot(s)
+        self._slots = []
+
+
+def _hold_new_task(mode, buffer, held_since):
+    """True while a new task should wait for free memory. container: below the buffer (strict);
+    desktop: below DESKTOP_HOLD_BYTES and never longer than DESKTOP_HOLD_MAX_S."""
+    avail = available_memory()
+    if mode == "desktop":
+        return avail < DESKTOP_HOLD_BYTES and (held_since is None or time.time() - held_since < DESKTOP_HOLD_MAX_S)
+    return avail < buffer
+
+
 def run_tiles(raster, l1_path, work, params, wins, flags, boxes, workers, buffer, presplit=False,
-              on_progress=None):
+              on_progress=None, procs=None, threads=None, mode="container"):
+    """Process all tiles (resumable). workers = parallel tasks; procs x threads = the layout
+    (default: `workers` processes x 1 thread, the old behaviour)."""
     tiles_dir = Path(work) / "tiles"
     tiles_dir.mkdir(parents=True, exist_ok=True)
+    if procs is None:
+        procs, threads = workers, 1
+    threads = threads or 1
     fin = lambda w: (tiles_dir / (win_name(w) + ".fin")).exists()  # noqa: E731
     state = [_tile_state(tiles_dir, w) for w in wins]
     todo = [i for i, s in enumerate(state) if s == "todo"]
@@ -1288,69 +1802,86 @@ def run_tiles(raster, l1_path, work, params, wins, flags, boxes, workers, buffer
         print("a saved tile does not fit today's memory budget: remaining tiles are processed as 4 sub-tiles")
         split += todo
         todo = []
-    queue, fails = deque(todo), {}
+    queue_, fails = deque(todo), {}
     total, finished, last = len(todo), 0, time.time()
-    while queue:
-        ex, live, held = _make_pool(workers), {}, 0.0
-        try:
-            while queue or live:
-                while queue and len(live) < workers:
-                    if live and available_memory() < buffer:   # others need the RAM: wait
-                        if time.time() - held > 30:
-                            print("  waiting: free memory is below the buffer", flush=True)
-                            held = time.time()
-                        break
-                    i = queue[0]
-                    fut = ex.submit(process_tile, mk(i))   # may raise BrokenProcessPool: i stays queued
-                    queue.popleft()
-                    live[fut] = i
-                dn, _ = wait(list(live), timeout=2, return_when=FIRST_COMPLETED)
-                for f in dn:
-                    st, _w = f.result()          # BrokenProcessPool propagates with live intact
-                    i = live.pop(f)
-                    if st == "memory":
-                        split.append(i)
-                    finished += 1
-                if time.time() - last > 10:
-                    print(f"  tiles {finished}/{total}", flush=True)
-                    if on_progress:
-                        on_progress(f"{ndone + finished} of {len(wins)} tiles done")
-                    last = time.time()
-            _kill_pool(ex)
-            ex = None
-        except BrokenProcessPool:
-            lost = [i for i in live.values() if not fin(wins[i])]
-            finished += len(live) - len(lost)
-            for i in lost:
-                fails[i] = fails.get(i, 0) + 1
-            again = [i for i in lost if fails[i] < 2]
-            split += [i for i in lost if fails[i] >= 2]
-            queue = deque(again + list(queue))
-            print(f"a worker died (probably out of memory): the pool is restarted with {workers} workers; "
-                  f"{len(again)} tile(s) are retried", flush=True)
-        finally:
-            _kill_pool(ex)
+    workers = max(1, min(workers, procs * threads))
+    pool = None
+    try:
+        if queue_:
+            pool = TilePool(procs, threads)
+        live, held, held_since = {}, 0.0, None
+        while queue_ or live:
+            while queue_ and len(live) < workers:
+                if live and _hold_new_task(mode, buffer, held_since):   # others need the RAM: wait
+                    held_since = held_since or time.time()
+                    if time.time() - held > 30:
+                        print("  waiting: free memory is low", flush=True)
+                        held = time.time()
+                    break
+                held_since = None
+                i = queue_.popleft()
+                live[pool.submit(mk(i))] = i
+            for kind, tid, val in pool.wait(2.0):
+                if kind == "lost":
+                    lost_i = [live.pop(t) for t in tid if t in live]
+                    lost = [i for i in lost_i if not fin(wins[i])]
+                    finished += len(lost_i) - len(lost)
+                    for i in lost:
+                        fails[i] = fails.get(i, 0) + 1
+                    again = [i for i in lost if fails[i] < 2]
+                    split += [i for i in lost if fails[i] >= 2]
+                    queue_ = deque(again + list(queue_))
+                    print(f"a worker process died (probably out of memory): it is restarted; "
+                          f"{len(again)} tile(s) are retried", flush=True)
+                    continue
+                if tid not in live:
+                    continue
+                i = live.pop(tid)
+                if kind == "error":
+                    raise RuntimeError(f"tile {win_name(wins[i])} failed: {val}")
+                if kind == "stopped":
+                    raise KeyboardInterrupt
+                if val[0] == "memory":
+                    split.append(i)
+                finished += 1
+            if time.time() - last > 10:
+                print(f"  tiles {finished}/{total}", flush=True)
+                if on_progress:
+                    on_progress(f"{ndone + finished} of {len(wins)} tiles done")
+                last = time.time()
+    finally:
+        if pool is not None:
+            pool.close()
     subs = [(i, s) for i in dict.fromkeys(split) for s in split4(wins[i]) if not fin(s)]
     if subs:
-        print(f"{len(subs)} sub-tile(s) of {len(set(split))} tile(s) are processed with 1 worker")
-        ex = None
+        print(f"{len(subs)} sub-tile(s) of {len(set(split))} tile(s) are processed one at a time")
+        pool = None
         try:
             for i, s in subs:
                 st = "memory"
                 for _attempt in (1, 2):
-                    if ex is None:
-                        ex = _make_pool(1)
-                    try:
-                        st, _ = ex.submit(process_tile, mk(i, s)).result()
+                    if pool is None:   # one worker process, or this program when no processes are used
+                        pool = TilePool(1, 1, inproc=procs <= 1)
+                    pool.submit(mk(i, s))
+                    res = []
+                    while not res:
+                        res = pool.wait(2.0)
+                    kind, _, val = res[0]
+                    if kind == "done":
+                        st = val[0]
                         break
-                    except BrokenProcessPool:
-                        _kill_pool(ex)
-                        ex = None
+                    if kind == "error":
+                        raise RuntimeError(f"tile {win_name(s)} failed: {val}")
+                    if kind == "stopped":
+                        raise KeyboardInterrupt
+                    pool.close()   # lost: the process died; one more try in a fresh process
+                    pool = None
                 if st != "ok":
                     raise UserError(f"tile {win_name(s)} does not fit in memory even when split; free memory, "
                                     "raise --max-memory-gb, or close other programs")
         finally:
-            _kill_pool(ex)
+            if pool is not None:
+                pool.close()
     return tiles_dir
 
 
@@ -1486,7 +2017,7 @@ def final_stage(merged, out, raster_crs, utm_crs, min_acres, keep_slivers, worke
     driver = "GPKG" if out.suffix.lower() == ".gpkg" else "ESRI Shapefile"
     layer = out.stem if driver == "GPKG" else None
     buf_w, buf_a, n_buf = [], [], 0
-    st = {"count": 0, "acres": 0.0, "sn": 0, "sa": 0.0, "noise": 0, "first": True}
+    st = {"count": 0, "acres": 0.0, "sn": 0, "sa": 0.0, "noise": 0, "na": 0.0, "first": True}
 
     def flush():
         nonlocal buf_w, buf_a, n_buf
@@ -1505,6 +2036,7 @@ def final_stage(merged, out, raster_crs, utm_crs, min_acres, keep_slivers, worke
         m2 = area_m2(g, raster_crs, utm_crs, workers)
         ok = m2 >= NOISE_M2
         st["noise"] += int((~ok).sum())
+        st["na"] += float(m2[~ok].sum()) / ACRE_M2
         g, area = g[ok], m2[ok] / ACRE_M2
         if not keep_slivers:
             keep = area >= min_acres
@@ -1524,13 +2056,16 @@ def final_stage(merged, out, raster_crs, utm_crs, min_acres, keep_slivers, worke
         if n_buf >= batch:
             flush()
 
-    group, n_group = [], 0
-    for wkb in _iter_chunks(merged):
-        group.append(wkb)
-        n_group += len(wkb)
-        if n_group >= 100_000:
-            process(group)
-            group, n_group = [], 0
+    group, n_group, b_group = [], 0, 0
+    for wkb in _iter_chunks(merged):   # groups of at most 100,000 pieces or about 32 MB of WKB (memory)
+        for k in range(0, len(wkb), 20_000):
+            part = wkb[k:k + 20_000]
+            group.append(part)
+            n_group += len(part)
+            b_group += sum(map(len, part))
+            if n_group >= 100_000 or b_group >= FINAL_GROUP_BYTES:
+                process(group)
+                group, n_group, b_group = [], 0, 0
     if group:
         process(group)
     flush()
@@ -1646,7 +2181,8 @@ def estimate_disk(cane_cells, wkb_per_cane, l1_path):
 def run(raster, l1_path, out, min_acres=0.2, utm=None, cane_value=1, workers=None,
         keep_slivers=False, do_filter=True, neighbors=4, threshold="majority",
         max_memory_gb=None, memory_buffer_gb=None, tile_size=None, clean=False, confirm_clean=None,
-        allow_non_utm=False, assume_l1_crs=False):
+        allow_non_utm=False, assume_l1_crs=False, processes=None, threads=None, memory_mode=None,
+        confirm_format=None, summary_line=False):
     raster, l1_path, out = Path(raster).resolve(), Path(l1_path).resolve(), Path(out).resolve()
     _T0[0] = t_start = time.time()
     if out.suffix.lower() not in (".shp", ".gpkg"):
@@ -1692,12 +2228,17 @@ def run(raster, l1_path, out, min_acres=0.2, utm=None, cane_value=1, workers=Non
         last.update(progress=msg, status=status, updated=time.strftime("%Y-%m-%d %H:%M:%S"))
         save_last_run(last)
 
+    def set_out(new):
+        last["out"] = str(new)
+        save_last_run(last)
+
     open_work(work)
     lock = acquire_lock(work)
     try:
         result = _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs, ans, params,
                              workers, max_memory_gb, memory_buffer_gb, tile_size, clean, confirm_clean,
-                             progress, t_start)
+                             progress, t_start, processes, threads, memory_mode, confirm_format,
+                             set_out, summary_line)
     except KeyboardInterrupt:
         release_lock(lock)
         progress("stopped by the user", "interrupted")
@@ -1707,7 +2248,7 @@ def run(raster, l1_path, out, min_acres=0.2, utm=None, cane_value=1, workers=Non
         progress(f"{type(e).__name__}: {e}"[:300], "failed")
         raise
     release_lock(lock)
-    if clean and (result is None or result.get("written") == str(out)):
+    if clean and (result is None or result.get("written") == result.get("out", str(out))):
         clean_work(work, keep_lock=False, remove_folder=True)
     if last.get("status") == "running":
         progress("finished", "finished")
@@ -1715,7 +2256,9 @@ def run(raster, l1_path, out, min_acres=0.2, utm=None, cane_value=1, workers=Non
 
 
 def _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs, ans, params, workers,
-                max_memory_gb, memory_buffer_gb, tile_size, clean, confirm_clean, progress, t_start):
+                max_memory_gb, memory_buffer_gb, tile_size, clean, confirm_clean, progress, t_start,
+                processes=None, threads=None, memory_mode_arg=None, confirm_format=None, set_out=None,
+                summary_line=False):
     tkey_items, fkey_items = stage_keys(raster, l1_path, out, utm_crs, ans)
     tkey, fkey = _hash(tkey_items), _hash(fkey_items)
     man_path, merged = work / "manifest.json", work / "merged.bin"
@@ -1737,7 +2280,8 @@ def _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs
               f"is ignored (remove the work folder to change it)")
 
     cores, (avail, total) = n_cpus(), memory_status()
-    buf = memory_buffer_bytes(total, memory_buffer_gb)
+    mode = memory_mode_arg if memory_mode_arg in ("desktop", "container") else memory_mode()
+    buf = memory_buffer_bytes(total, memory_buffer_gb, avail)
     budget = int(max_memory_gb * 1024 ** 3) if max_memory_gb else max(avail - buf, 256 * 1024 ** 2)
     cane_cells, densest = scan_raster(raster, ans["cane_value"], nodata)
     bpc, wkb_per_cane = probe(raster, params, densest)
@@ -1749,70 +2293,137 @@ def _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs
                            f"{free / 1024 ** 3:.2f} GB free in {out.parent}")
         e.needed, e.free = need, free
         raise e
-    bpc_plan = max(2.0 * bpc, 24.0)
+    bpc_plan = plan_bpc(bpc, mode)
     presplit = False
-    if old:   # tile plan comes from the manifest, only the number of workers is re-planned
-        t = old["tile"]
-        w = plan_workers(t, bpc_plan, budget, cores, workers)
-        if w < 1:
-            w, presplit = 1, True
-    else:
-        w, t, bpc_plan = make_plan(rows, cols, budget, cores, bpc, workers, tile_size)
-    w = max(1, min(w, 61 if os.name == "nt" else w))
+    t = old["tile"] if old else tile_size   # a resume keeps the saved tile plan; the layout is re-planned
+    nproc, nthr, t, w = plan_layout(rows, cols, budget, cores, bpc_plan, workers, t, processes, threads)
+    if old and thread_task_bytes(t, bpc_plan) > budget:
+        nproc, nthr, w, presplit = 1, 1, 1, True
     wins = tile_windows(rows, cols, t)
-    print(f"machine: {cores} cores, {avail / 1024 ** 3:.1f} GB available, buffer {buf / 1024 ** 3:.1f} GB, "
-          f"budget {budget / 1024 ** 3:.1f} GB -> {w} workers, tiles of {t} x {t} cells, {len(wins)} tiles "
+    lay = f"{nproc} processes x {nthr} thread{'s' if nthr > 1 else ''}" if nproc > 1 else \
+        f"1 process x {nthr} thread{'s' if nthr > 1 else ''}"
+    print(f"Machine: {cores} cores, {avail / 1024 ** 3:.1f} GB memory free -> using up to {budget / 1024 ** 3:.1f} GB "
+          f"(memory mode: {mode}, {buf / 1024 ** 3:.1f} GB kept free)")
+    print(f"Plan: {lay} = {w} tiles at a time, {len(wins)} tiles of {t} x {t} cells "
           f"(planned {bpc_plan:.0f} bytes per cell){' [saved tile plan]' if old else ''}")
+    notes = []
+    if mode == "desktop" and not max_memory_gb and nproc < min(w, cores) and not (processes or threads):
+        notes.append("Free memory is low: closing other programs (QGIS, browser tabs) lets the tool use more "
+                     "cores at full speed.")
+    est = int(cane_cells * wkb_per_cane)
+    if out.suffix.lower() == ".shp" and est > SHP_WARN_BYTES:
+        notes.append(f"The result may be about {est / 1024 ** 3:.1f} GB; a shapefile cannot be larger than 2 GB. "
+                     f"Use a GeoPackage (.gpkg) output for very large areas.")
+        if confirm_format and confirm_format(est):
+            out = out.with_suffix(".gpkg")
+            notes[-1] = f"The result may be about {est / 1024 ** 3:.1f} GB: saving as GeoPackage {out.name} instead."
+            fkey_items["out"] = str(out)
+            fkey = _hash(fkey_items)
+            if set_out:
+                set_out(out)
+    for n in notes:
+        print(f"NOTE: {n}")
     manifest = {"tiles_key": tkey, "tiles_items": tkey_items, "final_key": old.get("final_key") if old else None,
                 "final_items": fkey_items, "grid": [rows, cols, list(tf)[:6]], "tile": t, "nodata": nodata}
     if not old:
         _write_json(man_path, manifest)
-    tick(f"plan ({rows}x{cols} cells, {cane_cells:,} cane cells)")
 
-    out_ok = all(q.exists() for q in [out])
-    if old and old.get("final_key") == fkey and out_ok and merged.exists():
-        print(f"output {out.name} is already up to date for these settings")
+    times = {"plan": tick(f"plan ({rows}x{cols} cells, {cane_cells:,} cane cells)")}
+    out_ok = out.exists()
+    if old and old.get("final_key") == fkey and out_ok and merged.exists() and old.get("final_stats"):
         progress("finished (up to date)", "finished")
-        return None
+        s = old["final_stats"]
+        res = _result(s, out)
+        print_run_result(s, ans, utm_crs, out, work, clean, merged, notes,
+                         f"The output {out.name} was already up to date for these settings; nothing was written again.",
+                         times, time.time() - t_start, summary_line)
+        return res
+    reused = None
     if not merged.exists():
         l1_valid = prepare_l1(l1_path, crs, work, w)
         flags, boxes = tile_l1_flags(wins, tf, l1_valid)
-        tick(f"L1 prepared (reprojected, made valid): {sum(flags)} of {len(wins)} tiles touch L1")
+        times["prepare L1"] = tick(f"L1 prepared (reprojected, made valid): {sum(flags)} of {len(wins)} tiles touch L1")
         tiles_dir = run_tiles(raster, l1_valid, work, params, wins, flags, boxes, max(1, min(w, len(wins))),
-                              buf, presplit, progress)
-        tick("tiles (filter, polygonise, clip)")
+                              buf, presplit, progress, nproc, nthr, mode)
+        times["tiles"] = tick("tiles (filter, polygonise, clip)")
         tidy_tiles(tiles_dir, wins, rows, cols)
         progress("merging seams")
         st = merge_stage(work, tiles_dir, tf, w, budget)
-        tick(f"merge seams: {st['n_raw']:,} seam pieces, {st['n_groups']:,} merged groups, "
-             f"{st['n_pieces']:,} pieces saved")
+        times["merge"] = tick(f"merge seams: {st['n_raw']:,} seam pieces, {st['n_groups']:,} merged groups, "
+                              f"{st['n_pieces']:,} pieces saved")
         clean_work_tiles(tiles_dir)
         for nm in ("l1_valid.gpkg", "l1_valid.gpkg-wal", "l1_valid.gpkg-shm"):
             if (work / nm).exists():
                 (work / nm).unlink()
     else:
         print("reusing the saved tile and merge results (only the final stage runs)")
+        reused = ("Only the final stage ran (areas, slivers, writing): the saved tile and merge results "
+                  "of an earlier run were reused.")
     progress("writing output")
     s, written, note = final_stage(merged, out, crs, utm_crs, ans["min_acres"], ans["keep_slivers"], w)
-    tick(f"final stage: areas, slivers, write {written}")
+    times["write"] = tick(f"final stage: areas, slivers, write {written}")
+    s = {k: v for k, v in s.items() if k != "first"}
     if note:
-        print(f"NOTE: {note}")
+        notes.append(note)
     if written == out:
         manifest["final_key"] = fkey
+        manifest["final_stats"] = s
         _write_json(man_path, manifest)
-    cache = merged.stat().st_size if merged.exists() else 0
+    print_run_result(s, ans, utm_crs, written, work, clean, merged, notes, reused, times, time.time() - t_start,
+                     summary_line)
+    return _result(s, written, out)
+
+
+def _result(s, written, out=None):
+    return {"polygons": s["count"], "acres": s["acres"], "slivers": s["sn"], "sliver_acres": s["sa"],
+            "noise": s["noise"], "written": str(written), "out": str(out or written)}
+
+
+def print_run_result(s, ans, utm_crs, out, work, clean, merged, notes=(), headline=None, times=None, total_s=None,
+                     summary_line=False):
+    """End-of-run summary: NOTE lines, one plain headline (if any), the RESULT block and, with
+    --summary-line, the old machine-readable SUMMARY line."""
+    for n in notes or ():
+        print(f"NOTE: {n}")
+    if headline:
+        print(headline)
+    n = lambda v: f"{v:,}"          # noqa: E731
+    ac = lambda v: f"{v:,.3f}"      # noqa: E731
+    count, acres, sn, sa, noise, na = s["count"], s["acres"], s["sn"], s["sa"], s["noise"], s.get("na", 0.0)
+    a_written, a_sl, a_no = round(acres, 3), round(sa, 3), round(na, 3)
+    head = [("Remaining cane polygons written :", n(count)),
+            ("Total area                      :", ac(acres) + " acres")]
+    w = max(len(v) for _, v in head) - len(" acres")
+    head = [(f"{k} {v.rjust(w) if k.startswith('Remaining') else v.rjust(w + 6)}",) for k, v in head]
+    table = [("How the result was reached", "Polygons", "Acres"),
+             ("  Cane pieces inside L1", n(count + sn + noise), ac(a_written + a_sl + a_no))]
+    if not ans["keep_slivers"]:
+        table.append((f"  Removed: slivers below {ans['min_acres']} acres", n(sn), ac(a_sl)))
+    table.append(("  Removed: numerical noise", n(noise), ac(a_no)))
+    table.append(("  Written to the output", n(count), ac(a_written)))
+    maj = "no"
+    if ans["do_filter"]:
+        maj = f"yes, {ans['neighbors']} neighbours" + (", half rule" if ans.get("threshold") == "half" else "")
+    proj = utm_crs.name + (f" (EPSG:{utm_crs.to_epsg()})" if utm_crs.to_epsg() else "")
+    sl = "kept (not removed)" if ans["keep_slivers"] else f"removed below {ans['min_acres']} acres"
+    settings = [(f"  Majority filter : {maj}",), (f"  Projection      : {proj}",), (f"  Slivers         : {sl}",)]
+    files = [(f"  Output : {out}",)]
     if clean:
-        print("work folder removed (--clean)")
+        files.append(("  Cache  : removed after the run (--clean)",))
     else:
-        print(f"cache kept: {merged} ({cache / 1024 ** 2:.1f} MB); a rerun that only changes the projection "
-              f"or the sliver size reuses it. Remove the folder {work} to free the space (or use --clean).")
-    count, acres, sn, sa = s["count"], s["acres"], s["sn"], s["sa"]
-    print(f"SUMMARY polygons={count:,} total_acres={acres:,.3f} "
-          f"slivers_removed={sn:,} slivers_acres={sa:,.3f} noise_pieces_removed={s['noise']:,} "
-          f"before_removal: polygons={count + sn:,} acres={acres + sa:,.3f}")
-    print(f"TOTAL wall time {time.time() - t_start:.1f}s")
-    return {"polygons": count, "acres": acres, "slivers": sn, "sliver_acres": sa, "noise": s["noise"],
-            "written": str(written)}
+        size = Path(merged).stat().st_size if Path(merged).exists() else 0
+        files.append((f"  Cache  : {work} ({human_size(size)}) - a rerun that only changes the sliver size",))
+        files.append(("           or the projection reuses it and takes seconds. Safe to delete.",))
+    sections = [("", head), ("", table), ("Settings used", settings), ("Files", files)]
+    if total_s is not None:
+        names = (("prepare L1", "prepare L1"), ("tiles", "tiles"), ("merge", "merge"), ("write", "write"))
+        parts = " | ".join(f"{lab} {times[k]:.1f}" for k, lab in names if times and k in times)
+        sections.append(("", [(f"Time     : {total_s:.1f} s" + (f"  ({parts})" if parts else ""),)]))
+    print_result_block("RESULT", sections)
+    if summary_line:
+        print(f"SUMMARY polygons={count:,} total_acres={acres:,.3f} "
+              f"slivers_removed={sn:,} slivers_acres={sa:,.3f} noise_pieces_removed={noise:,} "
+              f"before_removal: polygons={count + sn:,} acres={acres + sa:,.3f}", flush=True)
 
 
 def clean_work_tiles(tiles_dir):
@@ -1887,6 +2498,94 @@ def parse_acres(a):
     return v, None
 
 
+WIN_BAD_CHARS = set('<>:"/\\|?*')
+WIN_RESERVED = {"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)}
+OUT_FORMATS = {"1": ".shp", "shp": ".shp", ".shp": ".shp", "2": ".gpkg", "gpkg": ".gpkg", ".gpkg": ".gpkg"}
+
+
+def output_name_check(a):
+    """Output name without extension; refuses what Windows does not allow (re-asked with a hint)."""
+    a = a.strip()
+    if Path(a).suffix.lower() in (".shp", ".gpkg"):
+        a = a[:-len(Path(a).suffix)].rstrip()
+    if not a:
+        return None, "Type a name."
+    bad = sorted({c for c in a if c in WIN_BAD_CHARS or ord(c) < 32})
+    if bad:
+        return None, f"A file name cannot contain {' '.join(bad)} (Windows rule). Spaces, - _ ( ) [ ] are fine."
+    if a[-1] in ". ":
+        return None, "A file name cannot end with a dot or a space (Windows rule)."
+    if a.split(".")[0].strip().lower() in WIN_RESERVED:
+        return None, f"{a} is a reserved name on Windows (CON, NUL, COM1, ...). Choose another name."
+    return a, None
+
+
+def _format_check(a):
+    v = OUT_FORMATS.get(a.strip().lower())
+    return (v, None) if v else (None, "Type 1 (shapefile) or 2 (GeoPackage).")
+
+
+def _folder_check(raw):
+    """(folder, stem or None, ext or None) or (None, hint). A full .shp/.gpkg path is split."""
+    p = Path(clean_path(raw))
+    stem = ext = None
+    if p.suffix.lower() in (".shp", ".gpkg"):
+        stem, ext, p = p.stem, p.suffix.lower(), p.parent
+    if p.exists() and not p.is_dir():
+        return None, f"{p} is a file, not a folder."
+    if not p.exists():
+        if not ask_yes_no(f"   The folder {p} does not exist. Create it?", True):
+            return None, "Type another folder."
+        try:
+            p.mkdir(parents=True)
+        except OSError as e:
+            return None, f"Cannot create it: {e}"
+    if not folder_writable(p):
+        return None, f"Cannot write in {p}. Choose another folder."
+    free = shutil.disk_usage(p).free
+    if free < 200 * 1024 ** 2:
+        return None, f"Only {free / 1024 ** 2:.0f} MB free in {p}. Choose a folder on a disk with more space."
+    return (p, stem, ext), None
+
+
+def ask_output(default_dir, default_stem, defaults):
+    """Ask the output as three questions - folder, name (no extension), format - then confirm an
+    existing file. Returns the output Path.
+
+    default_dir / default_stem: defaults when there is no previous answer. defaults (dict, may be
+    empty): "out" = a previous output path whose folder, name and format become the defaults;
+    "folder" / "fmt" (".shp" / ".gpkg") override single defaults. A full .shp / .gpkg path pasted
+    as the folder is accepted: its folder is used and its name and format become the next defaults.
+    On "no" to replacing an existing file the name question is asked again."""
+    defaults = defaults or {}
+    prev = Path(defaults["out"]) if defaults.get("out") else None
+    folder_def = str(defaults.get("folder") or (prev.parent if prev else default_dir))
+    stem_def = prev.stem if prev else default_stem
+    fmt = defaults.get("fmt") or (prev.suffix.lower() if prev and prev.suffix.lower() in (".shp", ".gpkg") else ".shp")
+    folder, stem, ext = ask_text("3) Output folder", folder_def, _folder_check)
+    stem_def, fmt = stem or stem_def, ext or fmt
+    while True:
+        stem = ask_text("   Output name", stem_def, output_name_check)
+        print("   A shapefile cannot be larger than 2 GB; choose 2 for very large areas.")
+        fmt = ask_text("   Save as:  1) Shapefile (.shp)   2) GeoPackage (.gpkg) ", "2" if fmt == ".gpkg" else "1",
+                       _format_check)
+        out = folder / (stem + fmt)
+        stem_def = stem
+        if out.exists():
+            if made_by_this_tool(out):
+                if not ask_yes_no(f"   {out.name} was made by an earlier run of this tool. Replace it?", True):
+                    continue
+            elif not ask_yes_no(f"   {out.name} already exists. Overwrite?", False):
+                continue
+        return out
+
+
+def ask_format_switch(est_bytes):
+    """Question-mode answer to 'the shapefile may get too large': True = save as GeoPackage."""
+    return ask_yes_no(f"   The result may be about {est_bytes / 1024 ** 3:.1f} GB, close to the 2 GB shapefile limit. "
+                      f"Save as GeoPackage (.gpkg) instead?", True)
+
+
 def out_check(ans):
     p = Path(clean_path(ans))
     if p.suffix.lower() not in (".shp", ".gpkg"):
@@ -1946,8 +2645,12 @@ def interactive(defaults):
         if not ask_yes_no("   Assume it uses the same coordinate system as the raster?", False):
             raise SystemExit("Stopped: give the L1 layer a coordinate system and run again.")
         assume = True
-    out = ask_text("3) Output file", defaults.get("out") or str(raster.with_name(raster.stem + "_remaining_cane.shp")),
-                   out_check)
+    prev_out = defaults.get("out")
+    od = {}
+    if prev_out:
+        same = defaults.get("raster") and Path(clean_path(str(defaults["raster"]))).resolve() == Path(raster).resolve()
+        od = {"out": prev_out} if same else {"folder": str(Path(prev_out).parent), "fmt": Path(prev_out).suffix.lower()}
+    out = ask_output(Path(raster).parent, Path(raster).stem + "_remaining_cane", od)
 
     do_filter = ask_yes_no("4) Apply the majority filter?", defaults.get("do_filter", True))
     neighbors = defaults.get("neighbors", 4)
@@ -2037,8 +2740,10 @@ def _validate_cli(a, ap):
         ap.error(f"--out: folder does not exist: {out.parent}")
     if a.min_acres < 0 or not math.isfinite(a.min_acres):
         ap.error("--min-acres must be 0 or more")
-    if a.workers is not None and a.workers < 1:
-        ap.error("--workers must be 1 or more")
+    for name in ("workers", "processes", "threads"):
+        v = getattr(a, name)
+        if v is not None and v < 1:
+            ap.error(f"--{name} must be 1 or more")
     if a.tile_size is not None and a.tile_size < 2:
         ap.error("--tile-size must be 2 or more")
     if a.max_memory_gb is not None and a.max_memory_gb <= 0:
@@ -2069,7 +2774,14 @@ def main(argv=None):
     ap.add_argument("--assume-l1-crs", action="store_true",
                     help="L1 without coordinate system: assume the raster's coordinate system")
     ap.add_argument("--cane-value", type=int, default=1)
-    ap.add_argument("--workers", type=int, default=None)
+    ap.add_argument("--workers", type=int, default=None,
+                    help="number of tiles processed in parallel (default: all cores)")
+    ap.add_argument("--processes", type=int, default=None,
+                    help="worker processes (default: planned from the memory budget; 1 = threads inside this program)")
+    ap.add_argument("--threads", type=int, default=None,
+                    help="threads per process (default: planned; processes x threads = parallel tiles)")
+    ap.add_argument("--memory-mode", choices=("auto", "desktop", "container"), default="auto",
+                    help="auto: container when a cgroup memory limit or MEM_GUARANTEE is set, else desktop")
     ap.add_argument("--keep-slivers", action="store_true")
     ap.add_argument("--no-filter", action="store_true", help="skip the majority filter")
     ap.add_argument("--neighbors", type=int, choices=(4, 8), default=4)
@@ -2077,16 +2789,19 @@ def main(argv=None):
     ap.add_argument("--max-memory-gb", type=float, default=None,
                     help="memory budget (default: available memory minus the buffer)")
     ap.add_argument("--memory-buffer-gb", type=float, default=None,
-                    help="memory kept free (default 2, or 1.5 on machines with 8 GB RAM or less)")
+                    help="memory kept free (default: 20%% of the available memory, between 0.5 and 1 GB)")
     ap.add_argument("--tile-size", type=int, default=None, help="tile edge in cells (default: planned)")
     ap.add_argument("--clean", action="store_true", help="remove the work folder (and the merge cache) after success")
+    ap.add_argument("--summary-line", action="store_true",
+                    help="also print the old one-line 'SUMMARY key=value' result for scripts")
     ap.add_argument("--ask", action="store_true", help="question-and-answer mode")
     a = ap.parse_args(argv)
 
     ask = a.ask or len(sys.argv if argv is None else argv) <= (1 if argv is None else 0)
     common = dict(cane_value=a.cane_value, workers=a.workers, threshold=a.majority_threshold,
                   max_memory_gb=a.max_memory_gb, memory_buffer_gb=a.memory_buffer_gb,
-                  tile_size=a.tile_size, clean=a.clean)
+                  tile_size=a.tile_size, clean=a.clean, processes=a.processes, threads=a.threads,
+                  memory_mode=None if a.memory_mode == "auto" else a.memory_mode, summary_line=a.summary_line)
     if ask:
         try:
             last = load_last_run()
@@ -2113,13 +2828,13 @@ def main(argv=None):
                 ans = interactive(defaults)
             while ans:
                 try:
-                    run(**ans, **common, confirm_clean=_ask_clean)
+                    run(**ans, **common, confirm_clean=_ask_clean, confirm_format=ask_format_switch)
                     break
                 except DiskSpaceError as e:
                     print(f"\n{e}")
                     if not ask_yes_no("Choose another output path?", True):
                         break
-                    ans["out"] = ask_text("Output file", None, out_check)
+                    ans["out"] = ask_output(Path(ans["out"]).parent, Path(ans["out"]).stem, {})
         except KeyboardInterrupt:
             print("\nStopped.")
         except SystemExit as e:
