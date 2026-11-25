@@ -722,25 +722,43 @@ def _clean_crossings(polys, tf, protected):
 
     Such a vertex lies on a cell-edge line in one coordinate only and the boundary crosses that
     line there (neither neighbour lies on it). Genuine vertices on a cell-edge line (where the
-    boundary turns onto a cane edge) have a neighbour on the line; L1 vertices are protected."""
-    out = []
-    for p in polys:
-        rings = [p.exterior] + list(p.interiors)
-        new, changed = [], False
-        for r in rings:
-            xy = np.asarray(r.coords)[:-1]
-            x, y = xy[:, 0], xy[:, 1]
-            gx, gy = _on_grid(x, tf.a, tf.c), _on_grid(y, tf.e, tf.f)
-            rm = (gx & ~gy & (np.roll(x, 1) != x) & (np.roll(x, -1) != x)) | \
-                 (gy & ~gx & (np.roll(y, 1) != y) & (np.roll(y, -1) != y))
-            if rm.any() and protected:
-                rm &= np.array([(a, b) not in protected for a, b in xy], dtype=bool)
-            if rm.any() and (~rm).sum() >= 3:
-                xy = xy[~rm]
-                changed = True
-            new.append(xy)
-        out.append(shapely.Polygon(new[0], new[1:]) if changed else p)
-    return np.array(out, dtype=object)
+    boundary turns onto a cane edge) have a neighbour on the line; L1 vertices are protected.
+    Vectorised over all rings; only polygons that lose a vertex are rebuilt."""
+    polys = np.asarray(polys, dtype=object)
+    if len(polys) == 0:
+        return polys
+    rings, pidx = shapely.get_rings(polys, return_index=True)
+    xy, ridx = shapely.get_coordinates(rings, return_index=True)
+    closing = np.r_[ridx[1:] != ridx[:-1], True]          # last (repeated) point of each ring
+    xy, ridx = xy[~closing], ridx[~closing]
+    n = len(xy)
+    if n == 0:
+        return polys
+    start = np.r_[True, ridx[1:] != ridx[:-1]]
+    end = np.r_[ridx[1:] != ridx[:-1], True]
+    first = np.maximum.accumulate(np.where(start, np.arange(n), 0))
+    last = np.minimum.accumulate(np.where(end, np.arange(n), n)[::-1])[::-1]
+    prev = np.where(start, last, np.arange(n) - 1)
+    nxt = np.where(end, first, np.arange(n) + 1)
+    x, y = xy[:, 0], xy[:, 1]
+    gx, gy = _on_grid(x, tf.a, tf.c), _on_grid(y, tf.e, tf.f)
+    rm = (gx & ~gy & (x[prev] != x) & (x[nxt] != x)) | (gy & ~gx & (y[prev] != y) & (y[nxt] != y))
+    if rm.any() and protected:
+        k = np.flatnonzero(rm)
+        rm[k] = np.array([(a, b) not in protected for a, b in xy[k]], dtype=bool)
+    if not rm.any():
+        return polys
+    out = polys.copy()
+    ring_poly = pidx
+    for pi in np.unique(ring_poly[ridx[rm]]):
+        rids = np.flatnonzero(ring_poly == pi)
+        new = []
+        for r in rids:
+            sel = ridx == r
+            keep = sel & ~rm
+            new.append(xy[keep] if keep.sum() >= 3 else xy[sel])
+        out[pi] = shapely.Polygon(new[0], new[1:])
+    return out
 
 
 def _spatial_order(geoms):
@@ -890,13 +908,20 @@ def tile_cane(src, win, p):
 
 
 def polygonise(mask, r0, c0):
-    """4-connected polygons of a bool block, in GLOBAL pixel coordinates (x = column, y = row)."""
+    """4-connected polygons of a bool block, in GLOBAL pixel coordinates (x = column, y = row).
+    The GeoJSON rings from rasterio are turned into polygons in one vectorised call."""
     if not mask.any():
         return np.array([], dtype=object)
     shift = rasterio.Affine.translation(c0, r0)
-    return np.array([shapely.geometry.shape(g) for g, _ in
-                     features.shapes(mask.view(np.uint8), mask=mask, transform=shift, connectivity=4)],
-                    dtype=object)
+    rings, ring_poly = [], []
+    for k, (g, _) in enumerate(features.shapes(mask.view(np.uint8), mask=mask, transform=shift, connectivity=4)):
+        for r in g["coordinates"]:
+            rings.append(r)
+            ring_poly.append(k)
+    lens = np.fromiter((len(r) for r in rings), dtype=np.int64, count=len(rings))
+    xy = np.array([c for r in rings for c in r], dtype=float)
+    lr = shapely.linearrings(xy, indices=np.repeat(np.arange(len(rings)), lens))
+    return np.asarray(shapely.polygons(lr, indices=np.asarray(ring_poly)), dtype=object)
 
 
 def _block_lines(a, b):
@@ -1275,8 +1300,10 @@ def run_tiles(raster, l1_path, work, params, wins, flags, boxes, workers, buffer
                             print("  waiting: free memory is below the buffer", flush=True)
                             held = time.time()
                         break
-                    i = queue.popleft()
-                    live[ex.submit(process_tile, mk(i))] = i
+                    i = queue[0]
+                    fut = ex.submit(process_tile, mk(i))   # may raise BrokenProcessPool: i stays queued
+                    queue.popleft()
+                    live[fut] = i
                 dn, _ = wait(list(live), timeout=2, return_when=FIRST_COMPLETED)
                 for f in dn:
                     st, _w = f.result()          # BrokenProcessPool propagates with live intact
