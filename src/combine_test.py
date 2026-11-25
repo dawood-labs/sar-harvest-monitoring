@@ -3,7 +3,7 @@
   hard weights : standing pixels that a first model calls harvested on the training dates get 10 times the
                  weight in a second training round (best overall score so far), 6 passes back
   own-dip gate : a pixel is kept as harvested only if it shows a sudden dip against its own previous passes
-                 (9 x 9 mean, VH, either track) - the user's relative idea (best on weak cane so far)
+                 (9 x 9 mean, VH, either track) - the relative idea (best on weak cane so far)
   soft gate    : the gate is skipped where the model is very sure (probability >= 0.9)
 All variants: 5x5 in-mask mean, trained on other report dates, 3 km block split, region growing, stays-cut.
 

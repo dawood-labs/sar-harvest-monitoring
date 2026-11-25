@@ -1,23 +1,42 @@
-# All settings live here, not in the code. Copy to config.yaml and fill in.
+# All settings live here, not in the code. Copy to configs/config.yaml and fill in.
+# Required keys
 aoi: myaoi                                             # short lower-case name used in file names
-season: {start: "YYYY-MM-DD", end: "YYYY-MM-DD"}       # one week before the crop-mask date -> after the last report date
+season: {start: "YYYY-MM-DD", end: "YYYY-MM-DD"}       # first pass to use -> after the last report date
 crs: {work: "EPSG:XXXXX", deliver: "EPSG:4326"}        # work = local UTM zone (area in metres)
 classes: {remaining_cane: 81, harvested: 82, cloud: 232}   # codes written in the field `predicted`
-min_piece_acres: 0.2                                   # pieces smaller than this are treated as slivers
 report_dates: ["YYYY-MM-DD"]                           # dates a harvest report is needed for
 paths:
-  raw: data/raw
-  reference_reports: data/raw/reference_reports        # crop mask + older harvest reports (read-only)
-  interim: data/interim
-  final: data/final
-  bucket: ""                                           # permanent storage; the machine disk is temporary
+  raw: data/raw                                        # downloaded Sentinel-1 / Sentinel-2 files
+  reference_reports: data/raw/reference_reports        # earlier (optical) harvest reports, read-only
+  interim: data/interim                                # caches and intermediate rasters
 seed: 42
-gee: {key_file: "", project: ""}                       # Earth Engine service-account key and project
+gee: {key_file: "", project: ""}                       # Earth Engine service-account key file and project
 crop_mask: ""                                          # polygons of standing cane at the start of the season
 s1_tracks: {}                                          # relative orbit: DESCENDING | ASCENDING (see src/s1_passes.py)
 s2_bands: [B2, B3, B4, B5, B8]                         # optical bands, used only to check results
 gee_workload_tag: harvest-sar                          # label under which Earth Engine compute is metered
-# Large areas (optional): smaller download blocks skip empty ground, SAR as int16 dB x 100, optical of the report day itself
-# download_block: 256
-# s1_int16: true
-# s2_exact_report_dates: true
+
+# Optional keys
+# original_reports: {"YYYY-MM-DD": "path/to/report.shp"}   # earlier optical reports, one per report date (scoring, training)
+# download_block: 256                                  # smaller download blocks skip empty ground (large areas)
+# s1_int16: true                                       # store SAR as int16 dB x 100
+# s2_exact_report_dates: true                          # optical image of the report day itself
+# s2: false                                            # false = download no optical images
+# download_files_at_once: 20                           # parallel downloads
+# download_concurrency: 40                             # total parallel Earth Engine requests
+# download_newest_first: false
+# Model and prediction
+# model_file: runs/<run>/model.txt                     # trained LightGBM model (predict_area.py)
+# model_files: {"YYYY-MM-DD": "runs/<run>/model_without_<date>.txt"}   # one model per held-out report date
+# model_tracks: {<new track>: <track slot of the model>}   # maps a new area's tracks onto the trained slots
+# directions: {des: [<tracks, preferred first>], asc: [<tracks>]}      # per look direction instead of fixed tracks
+# direction_mode: one                                  # one | max | recency (one model per look direction, answers combined)
+# smooth: 5                                            # in-mask mean window (pixels)
+# field_features: false                                # add field / segment level features
+# train_on_all_pixels: false                           # include edge pixels in training
+# extra_training: ""                                   # .npz (X, y) of another area added to the training set
+# recency_days: 6.0
+# output_tag: ""                                       # suffix of output names, e.g. _v2
+# grow_sure: 0.5                                       # region growing: sure / maybe probability limits
+# grow_maybe: 0.15
+# optical_tuned: ""                                    # json written by optical_tune.py

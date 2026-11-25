@@ -1,6 +1,6 @@
 """Clustering idea: split the pixels the model calls "harvested" by the SHAPE of their curve, drop the slides.
 
-Why (user's idea): one pixel's curve is noisy, so a rule on single pixels cannot tell a slow slide (weak cane)
+Why (idea): one pixel's curve is noisy, so a rule on single pixels cannot tell a slow slide (weak cane)
 from a real harvest. The mean curve of a group of similar pixels is clean. So:
   1. take every pixel the current method calls harvested on a report date;
   2. group them (k-means) by their VH curves on both tracks, each curve measured against the pixel's own

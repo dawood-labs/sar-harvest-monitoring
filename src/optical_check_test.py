@@ -1,4 +1,4 @@
-"""SAR first, optical only where SAR is unsure (the user's idea), scored by difference area.
+"""SAR first, optical only where SAR is unsure, scored by difference area.
 
 Model: the best so far (level + rate features, trained on inside pixels of the other report dates, region growing).
 Doubtful pixels = SAR says standing, but the model's harvest probability is at least LOW (it is not sure).

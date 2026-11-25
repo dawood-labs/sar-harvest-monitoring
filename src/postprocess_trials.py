@@ -1,7 +1,7 @@
 """Trials for the raster stage of postprocess.py: how much smoothing, and what smallest piece size?
 
 For every setting the three report dates are cleaned in order (earlier harvest stays harvested) and scored on:
-  difference area   acres of blocks >= 0.5 ac (>= 30 m wide) that disagree with the original report (user's measure)
+  difference area   acres of blocks >= 0.5 ac (>= 30 m wide) that disagree with the original report
   pieces            number of harvested / remaining pieces, and pieces smaller than 0.5 acre
   boundary          length of the harvested / remaining boundary in metres per acre of cane (lower = cleaner)
   sure flips        share of pixels the model was sure about (>= 0.9 or <= 0.1) whose class the cleaning changed

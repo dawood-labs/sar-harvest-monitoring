@@ -1,6 +1,6 @@
 """Relative dip features: judge every pixel against its OWN recent history, never against a fixed level.
 
-Why (user's idea): a weak field and a healthy field sit at different backscatter levels, so one absolute
+Why (idea): a weak field and a healthy field sit at different backscatter levels, so one absolute
 threshold is wrong for one of them. A harvest is a sudden dip relative to what that same pixel showed in the
 passes just before, and it is large compared with that pixel's own pass-to-pass noise. A weak crop sliding down
 slowly never shows such a dip.

@@ -100,7 +100,7 @@ def stretch(a: np.ndarray, lo: float, hi: float) -> np.ndarray:
 
 
 def fig_maps(cfg, d, series, pred, names, out):
-    """One zoom window on report 2's date: optical view, the user's 3-pass SAR composite, the report, the SAR result."""
+    """One zoom window on report 2's date: optical view, the 3-pass SAR composite, the report, the SAR result."""
     t = next(iter(cfg["s1_tracks"]))
     n, report = 2, cfg["report_dates"][1]
     rows, cols, group = d["rows"], d["cols"], d["group"]
@@ -118,7 +118,7 @@ def fig_maps(cfg, d, series, pred, names, out):
         return g[sl]
 
     with rasterio.open(Path(cfg["paths"]["raw"]) / "s2" / f"{cfg['aoi']}_s2_{report}.tif") as r:
-        s2 = r.read([4, 2, 1]).astype("float32")[:, sl[0], sl[1]]           # B5, B3, B2 = the user's usual view
+        s2 = r.read([4, 2, 1]).astype("float32")[:, sl[0], sl[1]]           # B5, B3, B2 = the usual view
     optical = np.dstack([stretch(b, *np.percentile(b, [2, 98])) for b in s2])
     dates = d[f"dates_{t}"][d[f"dates_{t}"] <= report][-3:]
     idx = [list(d[f"dates_{t}"]).index(x) for x in dates]

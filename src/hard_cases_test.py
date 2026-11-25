@@ -9,10 +9,10 @@ once-cut-stays-cut):
   rule          no model: harvested = a clean, big step on either track (limits tuned on the training blocks)
   dips only     model on the relative dip features of dip_features.py only (each pixel against its own history)
   baseline AND own dip <= X dB
-                the user's idea as a gate: the baseline says harvested AND the pixel itself shows a sudden dip of
+                the idea as a gate: the baseline says harvested AND the pixel itself shows a sudden dip of
                 at least X dB against its own previous passes (dip measured on a 9 x 9 mean, VH, either track)
 Scores: overall F1 on test blocks; precision and recall inside fields; acres of big in-field patches that are
-extra (SAR cut, original standing) or missed; and what each variant says on the user-reviewed patches.
+extra (SAR cut, original standing) or missed; and what each variant says on the manually reviewed patches.
 
 Usage: python src/hard_cases_test.py <area_name>
 Output: data/interim/<aoi>_hard_cases_scores_<area>.csv, ..._hard_cases_reviewed_<area>.csv, ..._hard_cases_pred_<area>.npz
