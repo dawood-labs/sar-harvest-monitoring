@@ -162,7 +162,7 @@ def test_overlapping_l1_polygons():
     l1 = [B(0, 0, 100, 100), B(50, 0, 150, 100)]
     final = [B(0, 0, 100, 97)]
     g81, g82, txt, _ = check(final, l1)
-    assert "L1 polygons overlap each other in 1 places" in txt
+    assert "L1 polygons overlap each other in 1 place;" in txt
 
 
 def test_invalid_holes_multipart():
@@ -307,7 +307,8 @@ def test_question_mode():
     finally:
         sys.stdin = old
     assert res is None and "Cancelled." in txt and "1) UTM 31N" in txt and "pieces <= 0.1 acres" in txt
-    assert "Create it?" in txt and (d / "new").is_dir() and "Windows rule" in txt and "Type 1 or 2." in txt
+    assert "Create it?" in txt and (d / "new").is_dir() and "Windows rule" in txt
+    assert "Type 1 (shapefile) or 2 (GeoPackage)." in txt
     assert "[f_harvest_final]" in txt and str(d / "new" / "q.gpkg") in txt and "2 GB" in txt
 
 

@@ -46,9 +46,10 @@ remaining cores run as threads (down to 1 process x N threads = threads inside t
 spawned, on small budgets). Every thread opens the raster and its part of L1 itself. --workers sets
 the number of parallel tiles; --processes / --threads fix the layout. The raster is processed tile by
 tile (window reads only, one-cell halo for the filter). Finished tiles are saved in
-<output stem>_work/ so an interrupted run resumes where it stopped; each stage deletes its inputs only
-after its own result is saved, and the output is written under a temporary name and swapped in at the
-end. The prepared L1 (reprojected, repaired) is kept in a cache folder in the user's home
+<output stem>_work/ so an interrupted run resumes where it stopped; a run with a new output
+name reads the saved tiles of the previous run in place when its inputs and tile settings match.
+Each stage deletes its inputs only after its own result is saved, and the output is written under a
+temporary name and swapped in at the end. The prepared L1 (reprojected, repaired) is kept in a cache folder in the user's home
 (.preprocess_classified/l1_prepared, at most 2 GB, least recently used first out; only files this
 tool created are deleted) so the next report date with the same L1 skips that step. Shapefile output
 is limited to 2 GB by the format; use .gpkg for very large results. The work folder holds a marker
@@ -76,6 +77,7 @@ import re
 import shutil
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import traceback
@@ -121,6 +123,8 @@ TASK_BASE_BYTES = 32 * 1024 ** 2      # per tile task besides its cells: L1 part
 DESKTOP_HOLD_BYTES = int(0.3 * 1024 ** 3)   # desktop mode: hold new tasks only below this much free memory
 DESKTOP_HOLD_MAX_S = 10.0             # ... and never longer than this per task
 MARKER = "preprocess_classified.workfolder"
+LOW_MEMORY_NOTE = ("Free memory is low: closing other programs (QGIS, browser tabs) lets the tool use more "
+                   "cores at full speed.")
 LOCK = "run.lock"
 SHP_SIDECARS = (".shp", ".shx", ".dbf", ".prj", ".cpg", ".sbn", ".sbx", ".qix", ".fbn", ".fbx",
                 ".ain", ".aih", ".atx", ".ixs", ".mxs", ".shp.xml")
@@ -148,6 +152,32 @@ class TileStopped(Exception):
 _STOP = threading.Event()   # set when the run stops: tile threads of this process end at the next block
 
 
+_START = [time.time()]   # start of the run clock (moved forward by the time spent on questions)
+
+
+def start_clock():
+    _T0[0] = _START[0] = time.time()
+
+
+def pause_clock(seconds):
+    """Leave `seconds` (time spent waiting for an answer) out of the stage times and the total."""
+    _T0[0] += seconds
+    _START[0] += seconds
+
+
+def run_seconds():
+    return time.time() - _START[0]
+
+
+def asked(fn, *args):
+    """Call a question function; the time the user needs to answer is not counted as run time."""
+    t = time.time()
+    try:
+        return fn(*args)
+    finally:
+        pause_clock(time.time() - t)
+
+
 def tick(msg):
     """Print a progress line with the seconds since the previous one; returns those seconds."""
     now = time.time()
@@ -155,6 +185,35 @@ def tick(msg):
     print(f"[{dt:7.1f}s] {msg}", flush=True)
     _T0[0] = now
     return dt
+
+
+def acres_text(v):
+    """Acres with 3 decimals and thousands separators; never a negative zero."""
+    return f"{round(float(v), 3) + 0.0:,.3f}"
+
+
+def plural(n, one, many=None):
+    """'1 piece' / '3 pieces' (n printed with thousands separators)."""
+    return f"{n:,} {one if n == 1 else (many or one + 's')}"
+
+
+def crs_label(crs):
+    """'WGS 84 / UTM zone 36N (EPSG:32636)' (the name alone when there is no EPSG code)."""
+    try:
+        c = pyproj.CRS(crs)
+    except Exception:
+        return str(crs)
+    return c.name + (f" (EPSG:{c.to_epsg()})" if c.to_epsg() else "")
+
+
+def status_text(state, progress):
+    """'finished' / 'interrupted, 3 of 42 tiles done' - the status word is never repeated."""
+    progress = (progress or "").strip()
+    if not progress or progress == state:
+        return state
+    if progress.startswith(state):
+        return progress
+    return f"{state}, {progress}"
 
 
 def print_result_block(title, sections):
@@ -186,6 +245,11 @@ def print_result_block(title, sections):
     print("=" * ((width - len(head)) // 2) + head + "=" * (width - len(head) - (width - len(head)) // 2))
     print("\n".join(lines))
     print("=" * width, flush=True)
+
+
+def wrap_rows(text, width=88):
+    """Result-block rows (one cell each) of a wrapped sentence: two spaces indent, four on the next lines."""
+    return [(x,) for x in textwrap.wrap(text, width, initial_indent="  ", subsequent_indent="    ")]
 
 
 def human_size(n):
@@ -1537,6 +1601,51 @@ def release_lock(lock):
         pass
 
 
+_FOREIGN_LOCKS = []   # locks this run holds on work folders of earlier runs whose saved work it reads
+
+
+def release_foreign_locks():
+    while _FOREIGN_LOCKS:
+        release_lock(_FOREIGN_LOCKS.pop())
+
+
+def find_reusable_work(work, key, grid, candidates, key_name="tiles_key", needed=("merged.bin",), marker=None,
+                       check=None):
+    """A work folder of an earlier run whose saved stage results can be read in place.
+
+    candidates: work folders to look at (the previous run's, or the one this folder reused before).
+    A folder counts when it carries the marker, its manifest has the same stage key (same inputs and
+    stage settings) and the same grid, and all `needed` files exist; `check(folder, manifest)` may add
+    a test. Its lock is taken (released at the end of this run) so that no other run changes it while
+    it is read; a folder locked by a live run is skipped. Nothing in that folder is ever changed or
+    deleted. Returns the folder or None (then the run works normally)."""
+    marker = marker or MARKER
+    seen = {Path(work).resolve()}
+    todo = [c for c in candidates if c]
+    hops = 0
+    while todo and hops < 20:
+        c = todo.pop(0)
+        hops += 1
+        try:
+            c = Path(c).resolve()
+            if c in seen or not (c / marker).exists():
+                continue
+            seen.add(c)
+            man = json.loads((c / "manifest.json").read_text())
+            if man.get(key_name) != key or (grid is not None and man.get("grid") != grid):
+                continue
+            if not all((c / f).exists() for f in needed) or (check and not check(c, man)):
+                # a folder that itself read its results from another one: follow that link
+                todo[:0] = [man[k] for k in ("reused_from", "overlay_from") if man.get(k)]
+                continue
+            lock = acquire_lock(c)
+        except (OSError, ValueError, UserError):
+            continue
+        _FOREIGN_LOCKS.append(lock)
+        return c
+    return None
+
+
 def _write_json(path, obj):
     tmp = Path(str(path) + ".tmp")
     tmp.write_text(json.dumps(obj, indent=1))
@@ -1595,9 +1704,11 @@ def _kill_pool(ex):
 
 
 def _run_task_safe(task):
-    """process_tile for a pool thread: ('done', status) or ('error', text)."""
+    """process_tile (or the task's own "fn", a module-level function that other tools of this folder pass)
+    for a pool thread: ('done', result), ('stopped', None) or ('error', text)."""
     try:
-        return ("done", process_tile(task))
+        fn = task.get("fn") if isinstance(task, dict) else None
+        return ("done", (fn or process_tile)(task))
     except TileStopped:
         return ("stopped", None)
     except BaseException as e:   # noqa: B902 - reported to the main program, which stops the run
@@ -2017,7 +2128,8 @@ def final_stage(merged, out, raster_crs, utm_crs, min_acres, keep_slivers, worke
     driver = "GPKG" if out.suffix.lower() == ".gpkg" else "ESRI Shapefile"
     layer = out.stem if driver == "GPKG" else None
     buf_w, buf_a, n_buf = [], [], 0
-    st = {"count": 0, "acres": 0.0, "sn": 0, "sa": 0.0, "noise": 0, "na": 0.0, "first": True}
+    st = {"count": 0, "acres": 0.0, "acres_exact": 0.0, "acres_all": 0.0, "sn": 0, "sa": 0.0, "noise": 0, "na": 0.0,
+          "first": True}
 
     def flush():
         nonlocal buf_w, buf_a, n_buf
@@ -2034,6 +2146,7 @@ def final_stage(merged, out, raster_crs, utm_crs, min_acres, keep_slivers, worke
         nonlocal buf_w, buf_a, n_buf
         g = shapely.from_wkb(np.concatenate(wkbs))
         m2 = area_m2(g, raster_crs, utm_crs, workers)
+        st["acres_all"] += float(m2.sum()) / ACRE_M2       # every piece, before any removal (exact)
         ok = m2 >= NOISE_M2
         st["noise"] += int((~ok).sum())
         st["na"] += float(m2[~ok].sum()) / ACRE_M2
@@ -2052,7 +2165,8 @@ def final_stage(merged, out, raster_crs, utm_crs, min_acres, keep_slivers, worke
         buf_a.append(a)
         n_buf += len(a)
         st["count"] += len(a)
-        st["acres"] += float(a.sum())
+        st["acres"] += float(a.sum())                       # = sum of the area_ac column
+        st["acres_exact"] += float(area.sum())
         if n_buf >= batch:
             flush()
 
@@ -2136,14 +2250,73 @@ def stage_keys(raster, l1_path, out, utm_crs, a):
     return t, f
 
 
-def describe_changes(old, new):
-    names = {"raster": "raster file", "l1": "L1 file", "cane_value": "cane value", "majority": "majority filter",
-             "neighbors": "number of neighbours", "threshold": "majority threshold",
-             "version": "script cache version", "block": "block size"}
-    ch = [f"{names.get(k, k)} ({old.get(k) if not isinstance(old.get(k), dict) else 'changed'} -> "
-          f"{new.get(k) if not isinstance(new.get(k), dict) else 'changed'})"
-          for k in sorted(set(old) | set(new)) if old.get(k) != new.get(k)]
-    return ", ".join(ch)
+TILE_KEY_NAMES = {"raster": "raster file", "l1": "L1 file", "cane_value": "cane value", "majority": "majority filter",
+                  "neighbors": "number of neighbours", "threshold": "majority threshold", "block": "block size"}
+
+
+def _is_file_sig(v):
+    return (isinstance(v, dict) and isinstance(v.get("path"), str) and isinstance(v.get("files"), list)
+            and all(isinstance(f, list) and len(f) == 3 for f in v["files"]))
+
+
+def _file_state(f, precise=False):
+    """'12.3 MB, saved 2026-11-20 10:00:01' from a signature entry [name, size, mtime_ns]
+    (precise: with milliseconds, for two states that differ by less than a second)."""
+    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(f[2] // 10 ** 9))
+    if precise:
+        when += f".{f[2] // 10 ** 6 % 1000:03d}"
+    return f"{human_size(f[1])}, saved {when}"
+
+
+def _setting_text(v):
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    return "not set" if v is None else str(v)
+
+
+def explain_changes(old, new, names=None):
+    """Why saved work does not match: (made_by_older_version, [plain sentences]).
+
+    Older version: the cache version differs or a file signature has an old format. A changed input
+    file is named with its old and new size and time; a changed setting as 'name (old -> new)'."""
+    names = names or TILE_KEY_NAMES
+    if not isinstance(old, dict) or old.get("version") != new.get("version"):
+        return True, []
+    file_keys = [k for k in new if _is_file_sig(new[k])]
+    if any(k in old and not _is_file_sig(old[k]) for k in file_keys):
+        return True, []
+    out, settings = [], []
+    for k in file_keys:
+        o, n = old.get(k), new[k]
+        if o == n or o is None:
+            continue
+        label = names.get(k, k)
+        if o["path"] != n["path"]:
+            out.append(f"A different {label} is used (before: {o['path']}; now: {n['path']}).")
+            continue
+        of, nf = {f[0]: f for f in o["files"]}, {f[0]: f for f in n["files"]}
+        for name in sorted(set(of) | set(nf)):
+            if name not in of:
+                out.append(f"The file {name} ({label}) was added since the last run.")
+            elif name not in nf:
+                out.append(f"The file {name} ({label}) was removed since the last run.")
+            elif of[name] != nf[name]:
+                exact = _file_state(of[name]) == _file_state(nf[name])
+                out.append(f"The file {name} ({label}) was modified since the last run "
+                           f"(before: {_file_state(of[name], exact)}; now: {_file_state(nf[name], exact)}).")
+    for k in sorted(set(old) | set(new)):
+        if k in file_keys or k == "version" or old.get(k) == new.get(k):
+            continue
+        settings.append(f"{names.get(k, k)} ({_setting_text(old.get(k))} -> {_setting_text(new.get(k))})")
+    if settings:
+        out.append("Setting changed: " + ", ".join(settings) + ".")
+    return False, out
+
+
+def describe_changes(old, new, names=None):
+    """explain_changes as one line of text."""
+    older, why = explain_changes(old, new, names)
+    return "This work folder was made by an older version of the tool." if older else " ".join(why)
 
 
 def resolve_area_crs(utm, raster_crs, bounds, allow_non_utm=False, warn=True):
@@ -2184,7 +2357,7 @@ def run(raster, l1_path, out, min_acres=0.2, utm=None, cane_value=1, workers=Non
         allow_non_utm=False, assume_l1_crs=False, processes=None, threads=None, memory_mode=None,
         confirm_format=None, summary_line=False):
     raster, l1_path, out = Path(raster).resolve(), Path(l1_path).resolve(), Path(out).resolve()
-    _T0[0] = t_start = time.time()
+    start_clock()
     if out.suffix.lower() not in (".shp", ".gpkg"):
         raise UserError("the output must end with .shp or .gpkg")
     if not out.parent.is_dir():
@@ -2217,9 +2390,10 @@ def run(raster, l1_path, out, min_acres=0.2, utm=None, cane_value=1, workers=Non
            "threshold": threshold, "keep_slivers": bool(keep_slivers), "min_acres": min_acres}
     params = dict(ans)
     work = out.parent / (out.stem + "_work")
+    prev_last = load_last_run()     # read before it is replaced: its work folder may be reusable
     last = {"raster": str(raster), "l1": str(l1_path), "out": str(out),
             "utm": f"EPSG:{utm_crs.to_epsg()}" if utm_crs.to_epsg() else utm_crs.to_wkt(),
-            "work": str(work), "answers": ans, "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "work": str(work), "data_work": str(work), "answers": ans, "started": time.strftime("%Y-%m-%d %H:%M:%S"),
             "status": "running", "progress": "starting", "pid": os.getpid(),
             "allow_non_utm": bool(allow_non_utm), "assume_l1_crs": bool(assume_l1_crs)}
     save_last_run(last)
@@ -2232,22 +2406,29 @@ def run(raster, l1_path, out, min_acres=0.2, utm=None, cane_value=1, workers=Non
         last["out"] = str(new)
         save_last_run(last)
 
+    def set_data_work(folder):      # the folder that really holds the saved stage results
+        last["data_work"] = str(folder)
+        save_last_run(last)
+
     open_work(work)
     lock = acquire_lock(work)
     try:
         result = _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs, ans, params,
                              workers, max_memory_gb, memory_buffer_gb, tile_size, clean, confirm_clean,
-                             progress, t_start, processes, threads, memory_mode, confirm_format,
-                             set_out, summary_line)
+                             progress, processes, threads, memory_mode, confirm_format,
+                             set_out, summary_line, prev_last, set_data_work)
     except KeyboardInterrupt:
         release_lock(lock)
+        release_foreign_locks()
         progress("stopped by the user", "interrupted")
         raise
     except BaseException as e:
         release_lock(lock)
+        release_foreign_locks()
         progress(f"{type(e).__name__}: {e}"[:300], "failed")
         raise
     release_lock(lock)
+    release_foreign_locks()
     if clean and (result is None or result.get("written") == result.get("out", str(out))):
         clean_work(work, keep_lock=False, remove_folder=True)
     if last.get("status") == "running":
@@ -2256,9 +2437,9 @@ def run(raster, l1_path, out, min_acres=0.2, utm=None, cane_value=1, workers=Non
 
 
 def _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs, ans, params, workers,
-                max_memory_gb, memory_buffer_gb, tile_size, clean, confirm_clean, progress, t_start,
+                max_memory_gb, memory_buffer_gb, tile_size, clean, confirm_clean, progress,
                 processes=None, threads=None, memory_mode_arg=None, confirm_format=None, set_out=None,
-                summary_line=False):
+                summary_line=False, prev_last=None, set_data_work=None):
     tkey_items, fkey_items = stage_keys(raster, l1_path, out, utm_crs, ans)
     tkey, fkey = _hash(tkey_items), _hash(fkey_items)
     man_path, merged = work / "manifest.json", work / "merged.bin"
@@ -2269,13 +2450,32 @@ def _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs
         except Exception:
             old = None
         if old is None or old.get("tiles_key") != tkey or old.get("grid") != [rows, cols, list(tf)[:6]]:
-            why = describe_changes(old.get("tiles_items", {}), tkey_items) if old else "work folder unreadable"
-            print(f"Setting changed for the tile stage: {why}. Tiles must be recomputed.")
-            if confirm_clean and not confirm_clean(work):
+            if old is None:
+                print("The saved work in this folder cannot be read; its tiles cannot be reused.")
+            else:
+                older, why = explain_changes(old.get("tiles_items"), tkey_items)
+                if older:
+                    print("This work folder was made by an older version of the tool; its saved tiles cannot be reused.")
+                elif why:
+                    print(" ".join(why) + " Tiles must be recomputed.")
+                else:
+                    print("The raster size or position differs from the saved tiles. Tiles must be recomputed.")
+            if confirm_clean and not asked(confirm_clean, work):
                 raise SystemExit("Stopped: the old work folder was kept.")
             clean_work(work)
             old = None
-    if tile_size is not None and old and old["tile"] != int(tile_size):
+    grid = [rows, cols, list(tf)[:6]]
+    src_work = None
+    if not merged.exists() and not (work / "tiles").is_dir():
+        src_work = find_reusable_work(work, tkey, grid, [old.get("reused_from") if old else None,
+                                                         (prev_last or {}).get("data_work"),
+                                                         (prev_last or {}).get("work")])
+        if src_work is not None:
+            if set_data_work:
+                set_data_work(src_work)
+            merged = src_work / "merged.bin"
+            print(f"Reusing saved work from {src_work}")
+    if tile_size is not None and old and old["tile"] != int(tile_size) and src_work is None:
         print(f"note: the saved tile plan ({old['tile']} cells) is kept for this resume; --tile-size {tile_size} "
               f"is ignored (remove the work folder to change it)")
 
@@ -2304,17 +2504,16 @@ def _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs
         f"1 process x {nthr} thread{'s' if nthr > 1 else ''}"
     print(f"Machine: {cores} cores, {avail / 1024 ** 3:.1f} GB memory free -> using up to {budget / 1024 ** 3:.1f} GB "
           f"(memory mode: {mode}, {buf / 1024 ** 3:.1f} GB kept free)")
-    print(f"Plan: {lay} = {w} tiles at a time, {len(wins)} tiles of {t} x {t} cells "
+    print(f"Plan: {lay} = {plural(w, 'tile')} at a time, {plural(len(wins), 'tile')} of {t} x {t} cells "
           f"(planned {bpc_plan:.0f} bytes per cell){' [saved tile plan]' if old else ''}")
     notes = []
     if mode == "desktop" and not max_memory_gb and nproc < min(w, cores) and not (processes or threads):
-        notes.append("Free memory is low: closing other programs (QGIS, browser tabs) lets the tool use more "
-                     "cores at full speed.")
+        notes.append(LOW_MEMORY_NOTE)
     est = int(cane_cells * wkb_per_cane)
     if out.suffix.lower() == ".shp" and est > SHP_WARN_BYTES:
         notes.append(f"The result may be about {est / 1024 ** 3:.1f} GB; a shapefile cannot be larger than 2 GB. "
                      f"Use a GeoPackage (.gpkg) output for very large areas.")
-        if confirm_format and confirm_format(est):
+        if confirm_format and asked(confirm_format, est):
             out = out.with_suffix(".gpkg")
             notes[-1] = f"The result may be about {est / 1024 ** 3:.1f} GB: saving as GeoPackage {out.name} instead."
             fkey_items["out"] = str(out)
@@ -2323,9 +2522,14 @@ def _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs
                 set_out(out)
     for n in notes:
         print(f"NOTE: {n}")
+    shown = len(notes)   # notes printed here are not repeated above the result block
     manifest = {"tiles_key": tkey, "tiles_items": tkey_items, "final_key": old.get("final_key") if old else None,
-                "final_items": fkey_items, "grid": [rows, cols, list(tf)[:6]], "tile": t, "nodata": nodata}
-    if not old:
+                "final_items": fkey_items, "grid": grid, "tile": t, "nodata": nodata}
+    if old and old.get("final_stats"):
+        manifest["final_stats"] = old["final_stats"]
+    if src_work is not None:
+        manifest["reused_from"] = str(src_work)
+    if not old or manifest.get("reused_from") != old.get("reused_from"):
         _write_json(man_path, manifest)
 
     times = {"plan": tick(f"plan ({rows}x{cols} cells, {cane_cells:,} cane cells)")}
@@ -2334,11 +2538,10 @@ def _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs
         progress("finished (up to date)", "finished")
         s = old["final_stats"]
         res = _result(s, out)
-        print_run_result(s, ans, utm_crs, out, work, clean, merged, notes,
+        print_run_result(s, ans, utm_crs, out, work, clean, merged, notes[shown:],
                          f"The output {out.name} was already up to date for these settings; nothing was written again.",
-                         times, time.time() - t_start, summary_line)
+                         times, run_seconds(), summary_line, src_work)
         return res
-    reused = None
     if not merged.exists():
         l1_valid = prepare_l1(l1_path, crs, work, w)
         flags, boxes = tile_l1_flags(wins, tf, l1_valid)
@@ -2355,10 +2558,8 @@ def _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs
         for nm in ("l1_valid.gpkg", "l1_valid.gpkg-wal", "l1_valid.gpkg-shm"):
             if (work / nm).exists():
                 (work / nm).unlink()
-    else:
+    elif src_work is None:
         print("reusing the saved tile and merge results (only the final stage runs)")
-        reused = ("Only the final stage ran (areas, slivers, writing): the saved tile and merge results "
-                  "of an earlier run were reused.")
     progress("writing output")
     s, written, note = final_stage(merged, out, crs, utm_crs, ans["min_acres"], ans["keep_slivers"], w)
     times["write"] = tick(f"final stage: areas, slivers, write {written}")
@@ -2369,56 +2570,80 @@ def _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs
         manifest["final_key"] = fkey
         manifest["final_stats"] = s
         _write_json(man_path, manifest)
-    print_run_result(s, ans, utm_crs, written, work, clean, merged, notes, reused, times, time.time() - t_start,
-                     summary_line)
+    print_run_result(s, ans, utm_crs, written, work, clean, merged, notes[shown:], None, times, run_seconds(),
+                     summary_line, src_work)
     return _result(s, written, out)
 
 
 def _result(s, written, out=None):
-    return {"polygons": s["count"], "acres": s["acres"], "slivers": s["sn"], "sliver_acres": s["sa"],
+    return {"polygons": s["count"], "acres": s["acres"], "acres_exact": s.get("acres_exact", s["acres"]),
+            "slivers": s["sn"], "sliver_acres": s["sa"],
             "noise": s["noise"], "written": str(written), "out": str(out or written)}
 
 
+def majority_text(ans):
+    """'no' / 'yes, 4 neighbours' / 'yes, 8 neighbours, half rule'."""
+    if not ans.get("do_filter"):
+        return "no"
+    return f"yes, {ans.get('neighbors')} neighbours" + (", half rule" if ans.get("threshold") == "half" else "")
+
+
+def time_line(times, total_s, names):
+    """'Time     : 7.3 s  (plan 0.5 | ...)'. The stages are consecutive, so they add up to the total
+    (each part is rounded on its own)."""
+    parts = " | ".join(f"{lab} {times[k]:.1f}" for k, lab in names if times and k in times)
+    return f"Time     : {total_s:.1f} s" + (f"  ({parts})" if parts else "")
+
+
 def print_run_result(s, ans, utm_crs, out, work, clean, merged, notes=(), headline=None, times=None, total_s=None,
-                     summary_line=False):
-    """End-of-run summary: NOTE lines, one plain headline (if any), the RESULT block and, with
-    --summary-line, the old machine-readable SUMMARY line."""
+                     summary_line=False, reused_from=None):
+    """End-of-run summary: NOTE lines (only those not printed yet), one plain headline (if any), the
+    RESULT block and, with --summary-line, the old machine-readable SUMMARY line.
+
+    All acres rows are exact sums, each rounded once for display; the area_ac column of the file holds
+    values rounded per polygon, and its sum is given in a footnote when it differs by more than 0.001."""
     for n in notes or ():
         print(f"NOTE: {n}")
     if headline:
         print(headline)
     n = lambda v: f"{v:,}"          # noqa: E731
-    ac = lambda v: f"{v:,.3f}"      # noqa: E731
+    ac = acres_text
     count, acres, sn, sa, noise, na = s["count"], s["acres"], s["sn"], s["sa"], s["noise"], s.get("na", 0.0)
-    a_written, a_sl, a_no = round(acres, 3), round(sa, 3), round(na, 3)
+    exact = s.get("acres_exact", acres)                       # older saved stats: sum of the rounded values
+    total_in = s.get("acres_all", exact + sa + na)
     head = [("Remaining cane polygons written :", n(count)),
-            ("Total area                      :", ac(acres) + " acres")]
+            ("Total area                      :", ac(exact) + " acres")]
     w = max(len(v) for _, v in head) - len(" acres")
     head = [(f"{k} {v.rjust(w) if k.startswith('Remaining') else v.rjust(w + 6)}",) for k, v in head]
     table = [("How the result was reached", "Polygons", "Acres"),
-             ("  Cane pieces inside L1", n(count + sn + noise), ac(a_written + a_sl + a_no))]
+             ("  Cane pieces inside L1", n(count + sn + noise), ac(total_in))]
     if not ans["keep_slivers"]:
-        table.append((f"  Removed: slivers below {ans['min_acres']} acres", n(sn), ac(a_sl)))
-    table.append(("  Removed: numerical noise", n(noise), ac(a_no)))
-    table.append(("  Written to the output", n(count), ac(a_written)))
-    maj = "no"
-    if ans["do_filter"]:
-        maj = f"yes, {ans['neighbors']} neighbours" + (", half rule" if ans.get("threshold") == "half" else "")
-    proj = utm_crs.name + (f" (EPSG:{utm_crs.to_epsg()})" if utm_crs.to_epsg() else "")
+        table.append((f"  Removed: slivers below {ans['min_acres']} acres", n(sn), ac(sa)))
+    table.append(("  Removed: numerical noise", n(noise), ac(na)))
+    table.append(("  Written to the output", n(count), ac(exact)))
+    if abs(acres - exact) > 0.001:
+        table.extend(wrap_rows(f"Note: adding up the area_ac column of the file gives {ac(acres)} acres "
+                               f"(each polygon is rounded to 3 decimals)."))
     sl = "kept (not removed)" if ans["keep_slivers"] else f"removed below {ans['min_acres']} acres"
-    settings = [(f"  Majority filter : {maj}",), (f"  Projection      : {proj}",), (f"  Slivers         : {sl}",)]
+    settings = [(f"  Majority filter : {majority_text(ans)}",), (f"  Projection      : {crs_label(utm_crs)}",),
+                (f"  Slivers         : {sl}",)]
     files = [(f"  Output : {out}",)]
-    if clean:
+    size = Path(merged).stat().st_size if Path(merged).exists() else 0
+    if reused_from is not None:
+        files.append((f"  Cache  : read from {reused_from} ({human_size(size)}); that folder was not changed.",))
+        if clean:
+            files.append((f"           --clean removed only {work}",))
+    elif clean:
         files.append(("  Cache  : removed after the run (--clean)",))
     else:
-        size = Path(merged).stat().st_size if Path(merged).exists() else 0
-        files.append((f"  Cache  : {work} ({human_size(size)}) - a rerun that only changes the sliver size",))
-        files.append(("           or the projection reuses it and takes seconds. Safe to delete.",))
+        files.append((f"  Cache  : {work} ({human_size(size)})",))
+        files.append(("           A rerun that only changes the sliver size, the projection or the output name",))
+        files.append(("           reuses it and takes seconds. Safe to delete.",))
     sections = [("", head), ("", table), ("Settings used", settings), ("Files", files)]
     if total_s is not None:
-        names = (("prepare L1", "prepare L1"), ("tiles", "tiles"), ("merge", "merge"), ("write", "write"))
-        parts = " | ".join(f"{lab} {times[k]:.1f}" for k, lab in names if times and k in times)
-        sections.append(("", [(f"Time     : {total_s:.1f} s" + (f"  ({parts})" if parts else ""),)]))
+        names = (("plan", "plan"), ("prepare L1", "prepare L1"), ("tiles", "tiles"), ("merge", "merge"),
+                 ("write", "write"))
+        sections.append(("", [(time_line(times, total_s, names),)]))
     print_result_block("RESULT", sections)
     if summary_line:
         print(f"SUMMARY polygons={count:,} total_acres={acres:,.3f} "
@@ -2548,7 +2773,7 @@ def _folder_check(raw):
     return (p, stem, ext), None
 
 
-def ask_output(default_dir, default_stem, defaults):
+def ask_output(default_dir, default_stem, defaults, made_by=None, label="3) Output folder"):
     """Ask the output as three questions - folder, name (no extension), format - then confirm an
     existing file. Returns the output Path.
 
@@ -2556,13 +2781,15 @@ def ask_output(default_dir, default_stem, defaults):
     empty): "out" = a previous output path whose folder, name and format become the defaults;
     "folder" / "fmt" (".shp" / ".gpkg") override single defaults. A full .shp / .gpkg path pasted
     as the folder is accepted: its folder is used and its name and format become the next defaults.
-    On "no" to replacing an existing file the name question is asked again."""
+    On "no" to replacing an existing file the name question is asked again. made_by(path): True when an
+    existing file comes from an earlier run of the calling tool (default: this tool)."""
     defaults = defaults or {}
+    made_by = made_by or made_by_this_tool
     prev = Path(defaults["out"]) if defaults.get("out") else None
     folder_def = str(defaults.get("folder") or (prev.parent if prev else default_dir))
     stem_def = prev.stem if prev else default_stem
     fmt = defaults.get("fmt") or (prev.suffix.lower() if prev and prev.suffix.lower() in (".shp", ".gpkg") else ".shp")
-    folder, stem, ext = ask_text("3) Output folder", folder_def, _folder_check)
+    folder, stem, ext = ask_text(label, folder_def, _folder_check)
     stem_def, fmt = stem or stem_def, ext or fmt
     while True:
         stem = ask_text("   Output name", stem_def, output_name_check)
@@ -2572,7 +2799,7 @@ def ask_output(default_dir, default_stem, defaults):
         out = folder / (stem + fmt)
         stem_def = stem
         if out.exists():
-            if made_by_this_tool(out):
+            if made_by(out):
                 if not ask_yes_no(f"   {out.name} was made by an earlier run of this tool. Replace it?", True):
                     continue
             elif not ask_yes_no(f"   {out.name} already exists. Overwrite?", False):
@@ -2709,22 +2936,32 @@ def _ask_clean(work):
 def describe_last(last):
     ans = last.get("answers", {})
     d, n = tiles_progress(last.get("work", ""))
-    try:
-        epsg = pyproj.CRS(last["utm"]).to_epsg()
-    except Exception:
-        epsg = "?"
     state = last.get("status", "?")
     if state == "running" and _pid_alive(last.get("pid")) is False:
         state = "interrupted"
     print("A previous run was found:")
     print(f"  raster      : {last['raster']}\n  L1 layer    : {last['l1']}\n  output      : {last['out']}")
-    maj = f"yes, {ans.get('neighbors')} neighbours, {ans.get('threshold')}" if ans.get("do_filter") else "no"
-    print(f"  majority    : {maj}")
-    print(f"  projection  : EPSG:{epsg}")
+    print(f"  majority    : {majority_text(ans)}")
+    print(f"  projection  : {crs_label(last.get('utm'))}")
     print(f"  slivers     : {'keep all' if ans.get('keep_slivers') else 'remove below ' + str(ans.get('min_acres')) + ' acres'}")
-    prog = last.get("progress", "")
     extra = f" ({d} of {n} tiles saved)" if n and state != "finished" else ""
-    print(f"  status      : {state}, {prog}{extra}, started {last.get('started', '?')}")
+    print(f"  status      : {status_text(state, last.get('progress', ''))}{extra}, started {last.get('started', '?')}")
+
+
+def _existing(path):
+    """The path when that file exists, else None (no default that cannot be used)."""
+    try:
+        return path if path and Path(path).is_file() else None
+    except (OSError, TypeError):
+        return None
+
+
+def last_inputs_exist(last, keys=("raster", "l1")):
+    """True when the input files of the previous run still exist (else its screen is skipped)."""
+    try:
+        return all(Path(last[k]).is_file() for k in keys)
+    except (KeyError, TypeError, OSError):
+        return False
 
 
 def _validate_cli(a, ap):
@@ -2807,6 +3044,13 @@ def main(argv=None):
             last = load_last_run()
             ans = None
             defaults = dict(raster=a.raster, l1=a.l1, out=a.out)
+            if last and not last_inputs_exist(last):
+                la = last.get("answers", {})
+                defaults = dict(raster=a.raster or _existing(last.get("raster")), l1=a.l1 or _existing(last.get("l1")),
+                                out=last["out"], do_filter=la.get("do_filter", True), neighbors=la.get("neighbors", 4),
+                                utm=last.get("utm"), slivers=not la.get("keep_slivers", False),
+                                min_acres=la.get("min_acres", 0.2))
+                last = None    # its input files are gone: straight to the questions
             if last:
                 describe_last(last)
                 la = last.get("answers", {})
