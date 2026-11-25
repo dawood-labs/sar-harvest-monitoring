@@ -568,19 +568,21 @@ def s1_complete(work):
 
 
 # ---------------------------------------------------------------- machine and pool
-def plan_machine(workers, max_memory_gb, memory_buffer_gb):
-    """(cores, available, buffer, budget, parallel chunk tasks wanted, memory mode)."""
+def plan_machine(workers, max_memory_gb, memory_buffer_gb, memory_mode=None):
+    """(cores, available, buffer, budget, parallel chunk tasks wanted, memory mode, own memory then)."""
     cores, (avail, total) = pc.n_cpus(), pc.memory_status()
     buf = pc.memory_buffer_bytes(total, memory_buffer_gb, avail)
     budget = int(max_memory_gb * 1024 ** 3) if max_memory_gb else max(avail - buf, 256 * 1024 ** 2)
     want = max(1, min(workers or cores, 61 if os.name == "nt" else (workers or cores)))
-    return cores, avail, buf, budget, want, pc.memory_mode()
+    mode = memory_mode if memory_mode in ("desktop", "container") else pc.memory_mode()
+    return cores, avail, buf, budget, want, mode, pc.process_rss()
 
 
 def plan_layout(n_chunks, task_bytes, budget, want, cores, processes=None, threads=None):
     """(processes, threads) for the chunk stages, like the tile layout of preprocess_classified.py:
-    as many worker processes (WORKER_BASE_BYTES each) as the budget holds next to the chunk tasks
-    (task_bytes each), the other cores as threads; 1 process = threads inside this program."""
+    as many worker processes (WORKER_BASE_BYTES each, measured) as the budget holds next to the chunk
+    tasks (task_bytes per thread): P x base + P x T x task <= budget; 1 process = threads inside
+    this program. `budget` is what is left after this program's own memory."""
     k = max(1, min(want, n_chunks or 1))
     if processes and threads:
         return processes, threads
@@ -703,7 +705,7 @@ def describe_changes(old, new):
 # ---------------------------------------------------------------- run
 def run(final, l1_path, out, sliver_acres=0.2, rule=True, utm=None, classes="both", workers=None,
         max_memory_gb=None, memory_buffer_gb=None, clean=False, allow_non_utm=False, assume_crs=False,
-        max_chunk_polygons=None, summary_line=False, processes=None, threads=None):
+        max_chunk_polygons=None, summary_line=False, processes=None, threads=None, memory_mode=None):
     final, l1_path, out = Path(final).resolve(), Path(l1_path).resolve(), Path(out).resolve()
     pc.start_clock()
     if out.suffix.lower() not in (".shp", ".gpkg"):
@@ -752,7 +754,7 @@ def run(final, l1_path, out, sliver_acres=0.2, rule=True, utm=None, classes="bot
     try:
         result = _run_locked(final, l1_path, out, work, wcrs, area_crs, ans, workers, max_memory_gb,
                              memory_buffer_gb, clean, progress, max_chunk_polygons, summary_line,
-                             processes, threads, prev_last)
+                             processes, threads, prev_last, memory_mode)
     except KeyboardInterrupt:
         pc.release_lock(lock)
         pc.release_foreign_locks()
@@ -780,7 +782,7 @@ def _read_manifest(path):
 
 def _run_locked(final, l1_path, out, work, wcrs, area_crs, ans, workers, max_memory_gb, memory_buffer_gb,
                 clean, progress, max_chunk_polygons, summary_line=False, processes=None, threads=None,
-                prev_last=None):
+                prev_last=None, memory_mode=None):
     k1i, k2i, k3i = stage_keys(final, l1_path, out, area_crs, ans)
     k1, k2, k3 = pc._hash(k1i), pc._hash(k2i), pc._hash(k3i)
     man_path = work / "manifest.json"
@@ -807,7 +809,8 @@ def _run_locked(final, l1_path, out, work, wcrs, area_crs, ans, workers, max_mem
     if man.get("overlay_done"):
         remove_valid_inputs(work)          # left by an older version of the tool
     tol = tolerance_of(wcrs)
-    cores, avail, buf, budget, want, mode = plan_machine(workers, max_memory_gb, memory_buffer_gb)
+    cores, avail, buf, budget, want, mode, rss_at_budget = plan_machine(workers, max_memory_gb, memory_buffer_gb,
+                                                                        memory_mode)
     print(f"Machine: {cores} cores, {avail / 1024 ** 3:.1f} GB memory free -> using up to {budget / 1024 ** 3:.1f} GB "
           f"(memory mode: {mode}, {buf / 1024 ** 3:.1f} GB kept free)")
     times, notes = {}, []
@@ -819,13 +822,14 @@ def _run_locked(final, l1_path, out, work, wcrs, area_crs, ans, workers, max_mem
         """Plan line (once) and the layout of the chunk stages."""
         if "layout" not in times_plan:
             task_b = max(int(cinfo["per_worker"]) - WORKER_BASE_BYTES, 1)
-            p, t = plan_layout(len(cinfo["chunks"]), task_b, budget, want, cores, processes, threads)
+            room = max(budget - pc.main_overhead(bool(max_memory_gb), rss_at_budget), 128 * 1024 ** 2)
+            p, t = plan_layout(len(cinfo["chunks"]), task_b, room, want, cores, processes, threads)
             k = max(1, min(p * t, len(cinfo["chunks"]) or 1))
             lay = f"{p} process{'es' if p > 1 else ''} x {t} thread{'s' if t > 1 else ''}"
             print(f"Plan: {lay} = {pc.plural(k, 'chunk')} at a time, {pc.plural(len(cinfo['chunks']), 'chunk')} "
                   f"of L1 polygons (biggest chunk about {cinfo['per_worker'] / 1024 ** 3:.2f} GB)")
-            if mode == "desktop" and not max_memory_gb and p < min(k, cores) and not (processes or threads):
-                print(f"NOTE: {pc.LOW_MEMORY_NOTE}")
+            if p < min(k, cores) and not (processes or threads):
+                print(f"NOTE: {pc.memory_note(bool(max_memory_gb), p)}")
             times_plan["layout"] = (p, t)
         return times_plan["layout"]
 
@@ -1199,11 +1203,10 @@ def print_summary(st, wst, ans, out=None, work=None, clean=False, times=None, no
             files.append(("  Cache  : removed after the run (--clean)",))
         elif work is not None:
             size = _folder_size(work)
-            files.append((f"  Cache  : {work} ({pc.human_size(size)})",))
-            files.append(("           A rerun that only changes the sliver rule, the projection, the classes or the "
-                          "output name reuses it.",))
             big = " It is large; delete it when you no longer need quick reruns." if size > 500 * 1024 ** 2 else ""
-            files.append(("           Safe to delete." + big,))
+            files.extend(pc.cache_rows("Cache ", work, pc.human_size(size), "A rerun that only changes the sliver "
+                                       "rule, the projection, the classes or the output name reuses it. Safe to "
+                                       "delete." + big))
     sections = [("", table), ("Area check (remaining + harvested must equal L1)", check)] + small
     sections += [("Settings used", settings), ("Files", files)]
     if total_s is not None:
@@ -1258,7 +1261,8 @@ def interactive(defaults):
         if not pc.ask_yes_no(f"   Assume it uses the same coordinate system as the {other} layer?", False):
             raise SystemExit(f"Stopped: give the {which} layer a coordinate system and run again.")
         assume = True
-    out = ask_output(final.parent, final.stem + "_harvest_final", defaults)
+    out = ask_output(final.parent, final.stem + "_harvest_final",
+                     pc.output_defaults(defaults.get("out"), defaults.get("final"), final))
     rule = pc.ask_yes_no("4) Turn small harvested pieces that touch remaining cane into remaining cane?",
                          defaults.get("rule", True))
     sliver = defaults.get("sliver_acres", 0.2)
@@ -1396,6 +1400,8 @@ def main(argv=None):
                     help="worker processes (default: planned from the memory budget; 1 = threads inside this program)")
     ap.add_argument("--threads", type=int, default=None,
                     help="threads per process (default: planned; processes x threads = parallel chunks)")
+    ap.add_argument("--memory-mode", choices=("auto", "desktop", "container"), default="auto",
+                    help="auto: container when a cgroup memory limit or MEM_GUARANTEE is set, else desktop")
     ap.add_argument("--max-memory-gb", type=float, default=None,
                     help="memory budget (default: available memory minus the buffer)")
     ap.add_argument("--memory-buffer-gb", type=float, default=None,
@@ -1407,7 +1413,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
     ask = a.ask or len(sys.argv if argv is None else argv) <= (1 if argv is None else 0)
     common = dict(workers=a.workers, max_memory_gb=a.max_memory_gb, memory_buffer_gb=a.memory_buffer_gb, clean=a.clean,
-                  processes=a.processes, threads=a.threads)
+                  processes=a.processes, threads=a.threads,
+                  memory_mode=None if a.memory_mode == "auto" else a.memory_mode)
     if ask:
         try:
             last = load_last_run()

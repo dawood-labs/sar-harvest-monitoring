@@ -77,7 +77,6 @@ import re
 import shutil
 import sys
 import tempfile
-import textwrap
 import threading
 import time
 import traceback
@@ -118,13 +117,71 @@ FINAL_GROUP_BYTES = 32 * 1024 ** 2   # final stage works on groups of about this
 SHP_WARN_BYTES = int(1.5 * 1024 ** 3)  # estimated result size above which a shapefile output gets a NOTE
 NOISE_M2 = 0.01                       # pieces below this area are numerical noise, always dropped
 BLOCK = int(os.environ.get("PREPROCESS_TEST_BLOCK", 512))   # largest block polygonised in one call (cells)
-WORKER_BASE_BYTES = 200 * 1024 ** 2   # python + libraries per worker process (measured: about 175 MB)
+BASE_FALLBACK_BYTES = (320 if os.name == "nt" else 220) * 1024 ** 2   # when the own memory cannot be read
+
+
+def process_rss():
+    """Resident memory of this process in bytes (psutil, else the Windows API, else /proc), or None."""
+    try:
+        import psutil
+        return int(psutil.Process().memory_info().rss)
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class PMC(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaNonPagedPoolUsage", ctypes.c_size_t), ("PagefileUsage", ctypes.c_size_t),
+                            ("PeakPagefileUsage", ctypes.c_size_t)]
+            pmc = PMC()
+            pmc.cb = ctypes.sizeof(PMC)
+            k = ctypes.windll.kernel32
+            k.GetCurrentProcess.restype = wintypes.HANDLE
+            if ctypes.windll.psapi.GetProcessMemoryInfo(k.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb):
+                return int(pmc.WorkingSetSize)
+        except Exception:
+            pass
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return None
+
+
+def _measured_base():
+    """Memory of one worker process = this process right after loading the libraries (every spawned
+    worker loads the same ones), +15 %. Resident memory counts the shared library pages in full for
+    every process: on Linux some of them are really shared, on Windows hardly any, so this errs on
+    the safe side."""
+    m = process_rss()
+    return int(max(m * 1.15, 150 * 1024 ** 2)) if m else BASE_FALLBACK_BYTES
+
+
+WORKER_BASE_BYTES = _measured_base()   # per worker process: interpreter + numpy, GDAL, GEOS, PROJ (measured)
 TASK_BASE_BYTES = 32 * 1024 ** 2      # per tile task besides its cells: L1 part, trees, buffers
 DESKTOP_HOLD_BYTES = int(0.3 * 1024 ** 3)   # desktop mode: hold new tasks only below this much free memory
 DESKTOP_HOLD_MAX_S = 10.0             # ... and never longer than this per task
 MARKER = "preprocess_classified.workfolder"
 LOW_MEMORY_NOTE = ("Free memory is low: closing other programs (QGIS, browser tabs) lets the tool use more "
                    "cores at full speed.")
+
+
+def memory_note(explicit_budget, procs):
+    """NOTE when the planner used fewer worker processes than parallel tasks because of memory."""
+    if explicit_budget:
+        return (f"The memory budget holds {plural(procs, 'worker process', 'worker processes')}; the other "
+                f"tasks run as threads (a larger --max-memory-gb allows more processes).")
+    return LOW_MEMORY_NOTE
+
+
 LOCK = "run.lock"
 SHP_SIDECARS = (".shp", ".shx", ".dbf", ".prj", ".cpg", ".sbn", ".sbx", ".qix", ".fbn", ".fbx",
                 ".ain", ".aih", ".atx", ".ixs", ".mxs", ".shp.xml")
@@ -219,25 +276,45 @@ def status_text(state, progress):
 RESULT_WIDTH = 80
 
 
+def _words(text):
+    return len(text.split())
+
+
 def wrap_line(line, width=RESULT_WIDTH):
-    """A long line split at spaces or path separators; the next lines are indented to the text after
-    'Label : ' (or two more than the line's own indent). Short lines are returned unchanged."""
+    """One logical line wrapped once to `width`.
+
+    Breaks fall at spaces or path separators ("/", "\\"); a line with " | " items (the Time line)
+    breaks only after a "|". The next lines are indented to the text after 'Label : ' (or two more
+    than the line's own indent; a line that is itself indented by 4 or more keeps that indent). A
+    last line of one or two words takes words from the line above when that line keeps at least
+    three. Short lines are returned unchanged."""
     if len(line) <= width:
         return [line]
     lead = len(line) - len(line.lstrip(" "))
     m = re.match(r"^(\s*\S[^:]{0,20}: )", line)
-    ind = " " * (len(m.group(1)) if m else lead + 2)
-    tokens = re.findall(r"[^ /\\]*[ /\\]|[^ /\\]+$", line)
-    out, cur = [], ""
+    ind = " " * (len(m.group(1)) if m else (lead if lead >= 4 else lead + 2))
+    if " | " in line:
+        tokens = re.findall(r".*?\| |.+$", line)
+    else:
+        tokens = re.findall(r"[^ /\\]*[ /\\]|[^ /\\]+$", line)
+    lines = [[]]
     for t in tokens:
-        if cur.strip() and len(cur) + len(t.rstrip()) > width:
-            out.append(cur.rstrip())
-            cur = ind + t.lstrip(" ")
+        cur = lines[-1]
+        text = ("" if len(lines) == 1 else ind) + "".join(cur) + t.rstrip()
+        if cur and "".join(cur).strip() and len(text) > width:
+            lines.append([t.lstrip(" ")])
         else:
-            cur += t
-    if cur.strip():
-        out.append(cur.rstrip())
-    return out
+            cur.append(t)
+
+    def render(k, toks):
+        return (("" if k == 0 else ind) + "".join(toks)).rstrip()
+    while len(lines) >= 2 and _words(render(len(lines) - 1, lines[-1])) < 3 and len(lines[-2]) > 1 \
+            and lines[-2][-1].endswith(" "):          # whole words or items only, never a piece of a path
+        moved = [lines[-2][-1].lstrip(" ")] + lines[-1]
+        if len(render(len(lines) - 1, moved)) > width or _words(render(len(lines) - 2, lines[-2][:-1])) < 3:
+            break
+        lines[-2], lines[-1] = lines[-2][:-1], moved
+    return [render(k, toks) for k, toks in enumerate(lines)]
 
 
 def print_result_block(title, sections):
@@ -271,9 +348,19 @@ def print_result_block(title, sections):
     print("=" * width, flush=True)
 
 
-def wrap_rows(text, width=88):
-    """Result-block rows (one cell each) of a wrapped sentence: two spaces indent, four on the next lines."""
-    return [(x,) for x in textwrap.wrap(text, width, initial_indent="  ", subsequent_indent="    ")]
+def wrap_rows(text, width=None):
+    """A sentence as one result-block row (two spaces indent); the block wraps it once, with the next
+    lines indented by four (or to the text after 'Label: ')."""
+    return [("  " + text,)]
+
+
+def cache_rows(label, folder, size, sentence):
+    """'  Cache  : <folder> (<size>)' and the sentence as its own paragraph below; when the size does
+    not fit next to the folder it starts the sentence's paragraph instead."""
+    first = f"  {label} : {folder} ({size})"
+    if len(first) <= RESULT_WIDTH:
+        return [(first,), ("           " + sentence,)]
+    return [(f"  {label} : {folder}",), (f"           ({size}) " + sentence,)]
 
 
 def human_size(n):
@@ -1499,8 +1586,8 @@ def make_plan(rows, cols, budget, cores, bpc, workers=None, tile=None):
 
 def plan_bpc(bpc, mode="container"):
     """Bytes per tile cell used for planning: container = 2 x the probe (worst case, a kill costs
-    the run); desktop = the probe plus a modest margin (a shortage only means paging)."""
-    return max(2.0 * bpc, 24.0) if mode == "container" else max(1.25 * bpc, 16.0)
+    the run); desktop = 1.5 x the probe (a shortage only means paging)."""
+    return max(2.0 * bpc, 24.0) if mode == "container" else max(1.5 * bpc, 20.0)
 
 
 def thread_task_bytes(t, bpc_plan):
@@ -1525,12 +1612,24 @@ def choose_layout(total, fit_procs, cores):
     return (1, total) if best[0] == 1 else best
 
 
-def plan_layout(rows, cols, budget, cores, bpc_plan, workers=None, tile=None, processes=None, threads=None):
+def main_overhead(explicit_budget, rss_at_budget):
+    """Memory of this (main) program that the worker layout must leave room for: with --max-memory-gb
+    (a budget for the whole run) all of it; with the automatic budget (free memory, which already
+    excludes what this program held then) only what it grew since."""
+    now = process_rss() or 0
+    return now if explicit_budget else max(0, now - (rss_at_budget or now))
+
+
+def plan_layout(rows, cols, budget, cores, bpc_plan, workers=None, tile=None, processes=None, threads=None,
+                base=None):
     """Tile size and layout. Returns (processes, threads, tile edge, total parallel tasks).
 
     total tasks = --workers (or processes x threads, or all cores); the tile is as large as allows a
     few tiles per task, shrunk until all tasks fit the budget as threads of ONE process; then as
-    many worker processes as the rest of the budget holds (WORKER_BASE_BYTES each)."""
+    many worker processes as the rest of the budget holds (base bytes each, default the measured
+    WORKER_BASE_BYTES): P x base + P x T x task <= budget, fewer processes and more threads when
+    the budget is small."""
+    base = base or WORKER_BASE_BYTES
     if processes and threads:
         total = processes * threads
     elif workers:
@@ -1553,7 +1652,7 @@ def plan_layout(rows, cols, budget, cores, bpc_plan, workers=None, tile=None, pr
     else:
         t = int(tile)
     t = max(2, min(t, max(rows, cols)))
-    fit = int(max(0, budget - total * thread_task_bytes(t, bpc_plan)) // WORKER_BASE_BYTES)
+    fit = int(max(0, budget - total * thread_task_bytes(t, bpc_plan)) // base)
     if processes and threads:
         p, th = processes, threads
     elif processes:
@@ -2592,6 +2691,7 @@ def _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs
     mode = memory_mode_arg if memory_mode_arg in ("desktop", "container") else memory_mode()
     buf = memory_buffer_bytes(total, memory_buffer_gb, avail)
     budget = int(max_memory_gb * 1024 ** 3) if max_memory_gb else max(avail - buf, 256 * 1024 ** 2)
+    rss_at_budget = process_rss()
     cane_cells, densest = scan_raster(raster, ans["cane_value"], nodata)
     bpc, wkb_per_cane = probe(raster, params, densest)
     need = 0 if merged.exists() else estimate_disk(cane_cells, wkb_per_cane, l1_path)
@@ -2605,7 +2705,14 @@ def _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs
     bpc_plan = plan_bpc(bpc, mode)
     presplit = False
     t = old["tile"] if old else tile_size   # a resume keeps the saved tile plan; the layout is re-planned
-    nproc, nthr, t, w = plan_layout(rows, cols, budget, cores, bpc_plan, workers, t, processes, threads)
+    l1_valid, dt_l1 = None, 0.0
+    if not merged.exists():   # prepared first: what this program holds afterwards is counted in the plan
+        t_l1 = time.time()
+        l1_valid = prepare_l1(l1_path, crs, work, cores)
+        dt_l1 = time.time() - t_l1
+        _T0[0] += dt_l1       # shown in the "L1 prepared" line, not in the plan line
+    room = max(budget - main_overhead(bool(max_memory_gb), rss_at_budget), 128 * 1024 ** 2)
+    nproc, nthr, t, w = plan_layout(rows, cols, room, cores, bpc_plan, workers, t, processes, threads)
     if old and thread_task_bytes(t, bpc_plan) > budget:
         nproc, nthr, w, presplit = 1, 1, 1, True
     wins = tile_windows(rows, cols, t)
@@ -2616,8 +2723,8 @@ def _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs
     print(f"Plan: {lay} = {plural(w, 'tile')} at a time, {plural(len(wins), 'tile')} of {t} x {t} cells "
           f"(planned {bpc_plan:.0f} bytes per cell){' [saved tile plan]' if old else ''}")
     notes = []
-    if mode == "desktop" and not max_memory_gb and nproc < min(w, cores) and not (processes or threads):
-        notes.append(LOW_MEMORY_NOTE)
+    if nproc < min(w, cores) and not (processes or threads):
+        notes.append(memory_note(bool(max_memory_gb), nproc))
     est = int(cane_cells * wkb_per_cane)
     if out.suffix.lower() == ".shp" and est > SHP_WARN_BYTES:
         notes.append(f"The result may be about {est / 1024 ** 3:.1f} GB; a shapefile cannot be larger than 2 GB. "
@@ -2653,7 +2760,7 @@ def _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs
                          times, run_seconds(), summary_line, src_work)
         return res
     if not merged.exists():
-        l1_valid = prepare_l1(l1_path, crs, work, w)
+        _T0[0] -= dt_l1
         flags, boxes = tile_l1_flags(wins, tf, l1_valid)
         times["prepare L1"] = tick(f"L1 prepared (reprojected, made valid): {sum(flags)} of {len(wins)} tiles touch L1")
         tiles_dir = run_tiles(raster, l1_valid, work, params, wins, flags, boxes, max(1, min(w, len(wins))),
@@ -2753,9 +2860,8 @@ def print_run_result(s, ans, utm_crs, out, work, clean, merged, notes=(), headli
     elif clean:
         files.append(("  Cache  : removed after the run (--clean)",))
     else:
-        files.append((f"  Cache  : {work} ({human_size(size)})",))
-        files.append(("           A rerun that only changes the sliver size, the projection or the output name",))
-        files.append(("           reuses it and takes seconds. Safe to delete.",))
+        files.extend(cache_rows("Cache ", work, human_size(size), "A rerun that only changes the sliver size, the "
+                                "projection or the output name reuses it and takes seconds. Safe to delete."))
     sections = [("", head), ("", table), ("Settings used", settings), ("Files", files)]
     if total_s is not None:
         names = (("plan", "plan"), ("prepare L1", "prepare L1"), ("tiles", "tiles"), ("merge", "merge"),
@@ -2924,6 +3030,19 @@ def ask_output(default_dir, default_stem, defaults, made_by=None, label="3) Outp
         return out
 
 
+def output_defaults(prev_out, prev_input, new_input):
+    """Defaults for the output questions: the previous folder, name and format when the input file
+    (raster / FINAL) is the same as in the previous run; with another input only the previous format
+    (folder and name then come from the new input)."""
+    if not prev_out:
+        return {}
+    try:
+        same = bool(prev_input) and Path(clean_path(str(prev_input))).resolve() == Path(new_input).resolve()
+    except (OSError, ValueError):
+        same = False
+    return {"out": prev_out} if same else {"fmt": Path(prev_out).suffix.lower()}
+
+
 def ask_format_switch(est_bytes):
     """Question-mode answer to 'the shapefile may get too large': True = save as GeoPackage."""
     return ask_yes_no(f"   The result may be about {est_bytes / 1024 ** 3:.1f} GB, close to the 2 GB shapefile limit. "
@@ -3011,11 +3130,7 @@ def interactive(defaults):
         if not ask_yes_no("   Assume it uses the same coordinate system as the raster?", False):
             raise SystemExit("Stopped: give the L1 layer a coordinate system and run again.")
         assume = True
-    prev_out = defaults.get("out")
-    od = {}
-    if prev_out:
-        same = defaults.get("raster") and Path(clean_path(str(defaults["raster"]))).resolve() == Path(raster).resolve()
-        od = {"out": prev_out} if same else {"folder": str(Path(prev_out).parent), "fmt": Path(prev_out).suffix.lower()}
+    od = output_defaults(defaults.get("out"), defaults.get("raster"), raster)
     out = ask_output(Path(raster).parent, Path(raster).stem + "_remaining_cane", od)
 
     do_filter = ask_yes_no("4) Apply the majority filter?", defaults.get("do_filter", True))

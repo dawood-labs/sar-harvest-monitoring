@@ -312,7 +312,7 @@ def test_post_wording():
     f, l1 = post_case(d)
     ppr.save_last_run(dict(last, final=str(d / "gone.gpkg"), l1=str(l1), out=str(d / "p.gpkg")))
     _, txt = piped(ppr.main, [str(f), "", "", "", "", "", "", "", "", "n"], ["--ask"])
-    assert "A previous run was found" not in txt and "Cancelled." in txt and "[p]" in txt
+    assert "A previous run was found" not in txt and "Cancelled." in txt and "[final_harvest_final]" in txt
 
 
 def test_pre_chain_of_new_names_computes_once():
@@ -469,3 +469,59 @@ def test_late_setting_change_lines():
     assert "Setting changed: sliver size (0.2 -> 0.5). Only the last steps run again" in txt
     _, txt = post_run(f, lp, d / "p.gpkg", sliver_acres=0.5, classes="82")
     assert "Setting changed: classes (both -> 82)" in txt and "Only the last step runs again." in txt
+
+
+def test_result_block_wraps_each_line_once():
+    paths = [r"C:\Users\analyst.name\Documents\Harvest Monitoring\Area 1\2026\ImageClassifier_remaining_cane",
+             r"C:\Users\a\x_work", "D:\\" + "\\".join(["very long folder name"] * 6) + "\\out"]
+    for p in paths:
+        rows = [("How the result was reached", "Polygons", "Acres"), ("  Written to the output", "28,246", "28,731.028")]
+        rows += pc.wrap_rows("Note: adding up the area_ac column of the file gives 28,731.001 acres (each polygon is "
+                             "rounded to 3 decimals).")
+        files = [(f"  Output : {p}.shp   (56,703 polygons)",)]
+        files += pc.cache_rows("Cache ", p + "_work", "72.5 MB", "A rerun that only changes the sliver size, the "
+                               "projection or the output name reuses it and takes seconds. Safe to delete.")
+        tl = pc.time_line({"plan": 1.0, "prepare L1": 4.6, "tiles": 11.3, "merge": 1.4, "write": 2.1}, 20.4,
+                          (("plan", "plan"), ("prepare L1", "prepare L1"), ("tiles", "tiles"), ("merge", "merge"),
+                           ("write", "write")))
+        sections = [("", rows), ("Files", files), ("", [(tl,)])]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            pc.print_result_block("RESULT", sections)
+        lines = out.getvalue().splitlines()
+        assert all(len(x) <= 80 for x in lines), [x for x in lines if len(x) > 80]
+        assert len(lines[0]) == len(lines[-1]) == 80
+        for _, rs in sections:                       # every logical line: wrapped once, no lonely words
+            for r in rs:
+                if len(r) != 1:
+                    continue
+                parts = pc.wrap_line(r[0])
+                assert "".join(x.strip() for x in parts).replace(" ", "") == r[0].replace(" ", ""), parts
+                for k, x in enumerate(parts[1:-1], 1):
+                    assert len(x.split()) >= 3 or "\\" in x, (k, parts)
+                if len(parts) > 1 and "|" in r[0]:
+                    assert all(x.rstrip().endswith("|") for x in parts[:-1]), parts
+        assert any("write 2.1)" in x for x in lines)
+        assert "(72.5 MB)" in out.getvalue()
+
+
+def test_output_defaults_follow_the_input():
+    d = Path(tempfile.mkdtemp())
+    (d / "old").mkdir()
+    (d / "new").mkdir()
+    r1, l1 = small_raster(d / "old")
+    r2, _ = small_raster(d / "new")
+    prev = {"raster": str(r1), "out": str(d / "old" / "prev_out.gpkg"), "utm": "EPSG:32631"}
+    ans = [str(r2), str(l1), "", "", "", "", "", "", "", "", "", "n"]
+    _, txt = piped(pc.interactive, ans, dict(prev, l1=str(l1)))
+    assert f"3) Output folder [{d / 'new'}]" in txt and "Output name [r_remaining_cane]" in txt and "(.gpkg)  [2]:" in txt
+    _, txt = piped(pc.interactive, [str(r1)] + ans[1:], dict(prev, l1=str(l1)))
+    assert f"3) Output folder [{d / 'old'}]" in txt and "Output name [prev_out]" in txt
+    f1, lp = post_case(d / "old")
+    f2, _ = post_case(d / "new")
+    prev = {"final": str(f1), "l1": str(lp), "out": str(d / "old" / "test_output_harvest_final_2.shp"), "utm": "EPSG:32631"}
+    ans = [str(f2), str(lp), "", "", "", "", "", "", "", "", "n"]
+    _, txt = piped(ppr.interactive, ans, prev)
+    assert f"3) Output folder [{d / 'new'}]" in txt and "Output name [final_harvest_final]" in txt and "(.gpkg)  [1]:" in txt
+    _, txt = piped(ppr.interactive, [str(f1)] + ans[1:], prev)
+    assert f"3) Output folder [{d / 'old'}]" in txt and "Output name [test_output_harvest_final_2]" in txt
