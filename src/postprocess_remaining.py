@@ -28,18 +28,25 @@ Steps (same result as the model)
      union of L1 (warning above 0.01 % difference).
 
 How it scales: the machine (cores, free memory) is read first; the L1 polygons are cut into
-spatial chunks sized from the memory budget (available memory minus a 1.5-2 GB buffer) and
-processed by a pool of worker processes. Each finished chunk is saved in <output stem>_work/,
-so an interrupted run resumes where it stopped. Stage caches: changing only the sliver rule,
-its size or the projection reruns only the classification stage; changing only the classes to
-write reruns only the writing. The work folder holds a marker file; the script only ever
-deletes its own files.
+spatial chunks sized from the memory budget (available memory minus a buffer of 20 % of it, at
+least 0.5 GB and at most 1 GB) and processed by P worker processes x T threads, planned like the
+tiles of preprocess_classified.py: as many processes as the budget holds (about 200 MB each), the
+other cores as threads (1 process = threads inside this program, on small budgets). --workers sets
+the number of chunks in parallel; --processes / --threads fix the layout. Each finished chunk is
+saved in <output stem>_work/, so an interrupted run resumes where it stopped. The repaired copies
+of the inputs that only the overlay stage reads are deleted as soon as that stage is saved.
+Stage caches: changing only the sliver rule, its size or the projection reruns only the
+classification stage; changing only the classes to write reruns only the writing. A run with a new
+output name reads the saved stages of the previous run in place (nothing there is changed) when its
+inputs and stage settings match. The work folder holds a marker file; the script only ever deletes
+its own files.
 
 Run without arguments (or with --ask) for a question-and-answer mode; all choices are also
 available as flags:
     python postprocess_remaining.py --final qc.shp --l1 l1.shp --out result.shp [--sliver-acres 0.2]
         [--no-sliver-rule] [--classes both|81|82] [--utm 47N | EPSG:32647] [--allow-non-utm]
-        [--assume-crs] [--workers N] [--max-memory-gb G] [--memory-buffer-gb B] [--clean] [--summary-line]
+        [--assume-crs] [--workers N] [--processes P] [--threads T] [--max-memory-gb G]
+        [--memory-buffer-gb B] [--clean] [--summary-line]
 """
 import argparse
 import json
@@ -50,8 +57,7 @@ import shutil
 import sys
 import time
 from collections import deque
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from concurrent.futures.process import BrokenProcessPool
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -79,6 +85,7 @@ CLASS_CHOICES = {"both": (REMAIN, HARVEST), "81": (REMAIN,), "82": (HARVEST,)}
 _OURS = re.compile(r"^(manifest\.json|chunks\.bin|clusters\.bin|classified\.bin|"
                    r"(l1|final)_valid(\.tmp)?\.gpkg(-wal|-shm|-journal)?)(\.tmp)?$")
 _CHUNK = re.compile(r"^c\d{6}\.s[12](\.tmp)?$")
+_VALID = re.compile(r"^(l1|final)_valid(\.tmp)?\.gpkg(-wal|-shm|-journal)?(\.tmp)?$")
 UserError = pc.UserError
 DiskSpaceError = pc.DiskSpaceError
 tick = pc.tick
@@ -167,7 +174,8 @@ def working_crs(final_path, l1_path, assume_crs=False):
 
 
 def write_valid(path, geoms, crs, lid=False):
-    tmp = Path(str(path).replace(".gpkg", ".tmp.gpkg"))
+    path = Path(path)
+    tmp = path.with_name(path.stem + ".tmp.gpkg")
     for q in pc.file_set(tmp, pc.GPKG_SIDECARS).values():
         if q.exists():
             q.unlink()
@@ -308,7 +316,8 @@ def _chunk_classes(task):
     rl, rs = d["r_lid"], d["r_seam"]
     # pieces below 0.01 m2 are numerical noise of the overlay: dropped here, so they never change
     # class and never bridge two polygons that only touch at a corner
-    hm2, rm2 = area_m2(h, wcrs, acrs), area_m2(r, wcrs, acrs)
+    hm2_all, rm2_all = area_m2(h, wcrs, acrs), area_m2(r, wcrs, acrs)
+    hm2, rm2 = hm2_all, rm2_all
     hk, rk = hm2 >= NOISE_M2, rm2 >= NOISE_M2
     st = {"pieces": int(hk.sum()), "touching": 0, "absorbed": 0, "absorbed_acres": 0.0, "touching_acres": 0.0,
           "noise_overlay": int((~hk).sum() + (~rk).sum()), "noise_overlay_m2": float(hm2[~hk].sum() + rm2[~rk].sum())}
@@ -342,8 +351,9 @@ def _chunk_classes(task):
     seam = np.concatenate([s81, s82])
     lids = np.concatenate([l81, l82])
     fin = geoms[~seam]
-    lg, llid = read_valid(task["l1"], task["bbox_pad"], lid=True)
-    l1m2 = float(area_m2(lg[np.isin(llid, d["lids"])], wcrs, acrs).sum())
+    # every L1 polygon is split by the overlay into its remaining and harvested pieces, so the sum of
+    # all piece areas (noise included) is the area of the chunk's L1 polygons
+    l1m2 = float(hm2_all.sum() + rm2_all.sum())
     res = {"fin_wkb": pc.to_wkb(fin), "fin_cls": cls[~seam], "fin_m2": area_m2(fin, wcrs, acrs),
            "seam_wkb": pc.to_wkb(geoms[seam]), "seam_cls": cls[seam], "seam_lid": lids[seam],
            "l1_m2": l1m2, "stats": st}
@@ -503,6 +513,16 @@ def _clean_dir(d):
             pass
 
 
+def remove_valid_inputs(work):
+    """Delete the repaired copies of the inputs (only stage 1 reads them) once stage 1 is saved."""
+    for f in list(Path(work).iterdir()):
+        if f.is_file() and _VALID.match(f.name):
+            try:
+                f.unlink()
+            except OSError:
+                pass   # open elsewhere (Windows): removed by a later run
+
+
 def clean_work(work, stage=1, remove_folder=False):
     """Delete only this script's own files: stage 1 = everything, 2 = classification and later."""
     work = Path(work)
@@ -518,6 +538,8 @@ def clean_work(work, stage=1, remove_folder=False):
             if f.is_file() and _OURS.match(f.name):
                 f.unlink()
     if remove_folder:
+        if (work / LOCK).exists():
+            pc.release_lock(work / LOCK)
         try:
             left = [f.name for f in work.iterdir()]
         except OSError:
@@ -530,63 +552,110 @@ def clean_work(work, stage=1, remove_folder=False):
                 pass
 
 
-# ---------------------------------------------------------------- pool
-def run_pool(fn, tasks, workers, buffer, label, on_progress=None):
-    """Run the tasks whose result file is missing; resume-safe; a dead worker restarts the pool."""
+def s1_complete(work):
+    """True when every overlay chunk result of a work folder is saved."""
+    try:
+        n = len(pc._load(Path(work) / "chunks.bin")["chunks"])
+        return all((Path(work) / "s1" / f"c{i:06d}.s1").exists() for i in range(n))
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------- machine and pool
+def plan_machine(workers, max_memory_gb, memory_buffer_gb):
+    """(cores, available, buffer, budget, parallel chunk tasks wanted, memory mode)."""
+    cores, (avail, total) = pc.n_cpus(), pc.memory_status()
+    buf = pc.memory_buffer_bytes(total, memory_buffer_gb, avail)
+    budget = int(max_memory_gb * 1024 ** 3) if max_memory_gb else max(avail - buf, 256 * 1024 ** 2)
+    want = max(1, min(workers or cores, 61 if os.name == "nt" else (workers or cores)))
+    return cores, avail, buf, budget, want, pc.memory_mode()
+
+
+def plan_layout(n_chunks, task_bytes, budget, want, cores, processes=None, threads=None):
+    """(processes, threads) for the chunk stages, like the tile layout of preprocess_classified.py:
+    as many worker processes (WORKER_BASE_BYTES each) as the budget holds next to the chunk tasks
+    (task_bytes each), the other cores as threads; 1 process = threads inside this program."""
+    k = max(1, min(want, n_chunks or 1))
+    if processes and threads:
+        return processes, threads
+    if processes:
+        return processes, max(1, -(-k // processes))
+    if threads:
+        return max(1, -(-k // threads)), threads
+    while k > 1 and k * task_bytes > budget:
+        k -= 1
+    fit = int(max(0, budget - k * task_bytes) // WORKER_BASE_BYTES)
+    return pc.choose_layout(k, fit if fit >= 2 else 1, max(cores, k))
+
+
+def run_pool(fn, tasks, procs, threads, buffer, label, mode="container", on_progress=None):
+    """Run the tasks whose result file is missing on procs x threads (pc.TilePool); resume-safe.
+    A chunk that runs out of memory is retried with fewer chunks at a time; a dead worker process is
+    restarted and its chunks are retried."""
     todo = [t for t in tasks if not Path(t["path"]).exists()]
     ndone = len(tasks) - len(todo)
     if ndone:
         print(f"resuming: {ndone} of {len(tasks)} {label} chunks already done", flush=True)
+    if not todo:
+        return
     stop_after = int(os.environ.get("POSTPROCESS_TEST_STOP_AFTER", "0") or 0)
     queue, fails, finished, last = deque(todo), {}, 0, time.time()
-    workers = max(1, min(workers, len(todo) or 1))
-    while queue:
-        ex, live, held, retry = pc._make_pool(workers), {}, 0.0, False
-        try:
-            while (queue and not retry) or live:
-                while queue and not retry and len(live) < workers:
-                    if live and pc.available_memory() < buffer:
-                        if time.time() - held > 30:
-                            print("  waiting: free memory is below the buffer", flush=True)
-                            held = time.time()
-                        break
-                    t = queue.popleft()
-                    live[ex.submit(fn, t)] = t
-                dn, _ = wait(list(live), timeout=2, return_when=FIRST_COMPLETED)
-                for f in dn:
-                    t = live.pop(f)
-                    if f.result() == "memory":
+    limit = max(1, min(procs * threads, len(todo)))
+    pool = pc.TilePool(procs, threads)
+    live, held, held_since = {}, 0.0, None
+    try:
+        while queue or live:
+            while queue and len(live) < limit:
+                if live and pc._hold_new_task(mode, buffer, held_since):   # others need the RAM: wait
+                    held_since = held_since or time.time()
+                    if time.time() - held > 30:
+                        print("  waiting: free memory is low", flush=True)
+                        held = time.time()
+                    break
+                held_since = None
+                t = queue.popleft()
+                live[pool.submit(dict(t, fn=fn))] = t
+            for kind, tid, val in pool.wait(2.0):
+                if kind == "lost":
+                    lost = [live.pop(x) for x in tid if x in live]
+                    again = [t for t in lost if not Path(t["path"]).exists()]
+                    finished += len(lost) - len(again)
+                    for t in again:
                         fails[t["path"]] = fails.get(t["path"], 0) + 1
-                        if fails[t["path"]] >= 2:
-                            raise UserError(f"a {label} chunk does not fit in memory even alone; free memory or "
-                                            f"raise --max-memory-gb")
-                        queue.append(t)
-                        retry = True
-                        continue
-                    finished += 1
-                    if stop_after and label == "overlay" and finished >= stop_after:
-                        raise KeyboardInterrupt("test stop")
-                if time.time() - last > 10:
-                    print(f"  {label}: {ndone + finished} of {len(tasks)} chunks", flush=True)
-                    if on_progress:
-                        on_progress(f"{label}: {ndone + finished} of {len(tasks)} chunks")
-                    last = time.time()
-        except BrokenProcessPool:
-            lost = [t for t in live.values() if not Path(t["path"]).exists()]
-            finished += len(live) - len(lost)
-            for t in lost:
-                fails[t["path"]] = fails.get(t["path"], 0) + 1
-                if fails[t["path"]] >= 3:
-                    raise UserError(f"a worker died three times on the same {label} chunk (out of memory?); "
-                                    f"free memory or raise --max-memory-gb")
-            queue = deque(lost + list(queue))
-            retry = True
-            print(f"a worker died (probably out of memory): {len(lost)} chunk(s) are retried", flush=True)
-        finally:
-            pc._kill_pool(ex)
-        if retry and workers > 1:
-            workers = max(1, workers // 2)
-            print(f"  continuing with {workers} worker(s)", flush=True)
+                        if fails[t["path"]] >= 3:
+                            raise UserError(f"a worker died three times on the same {label} chunk (out of memory?); "
+                                            f"free memory or raise --max-memory-gb")
+                    queue = deque(again + list(queue))
+                    print(f"a worker process died (probably out of memory): it is restarted; "
+                          f"{pc.plural(len(again), 'chunk')} retried", flush=True)
+                    continue
+                if tid not in live:
+                    continue
+                t = live.pop(tid)
+                if kind == "error":
+                    raise RuntimeError(f"a {label} chunk failed: {val}")
+                if kind == "stopped":
+                    raise KeyboardInterrupt
+                if val == "memory":
+                    fails[t["path"]] = fails.get(t["path"], 0) + 1
+                    if fails[t["path"]] >= 2:
+                        raise UserError(f"a {label} chunk does not fit in memory even alone; free memory or "
+                                        f"raise --max-memory-gb")
+                    queue.append(t)
+                    if limit > 1:
+                        limit = max(1, limit // 2)
+                        print(f"  out of memory: continuing with {pc.plural(limit, 'chunk')} at a time", flush=True)
+                    continue
+                finished += 1
+                if stop_after and label == "overlay" and finished >= stop_after:
+                    raise KeyboardInterrupt("test stop")
+            if time.time() - last > 10:
+                print(f"  {label}: {ndone + finished} of {len(tasks)} chunks", flush=True)
+                if on_progress:
+                    on_progress(f"{label}: {ndone + finished} of {len(tasks)} chunks")
+                last = time.time()
+    finally:
+        pool.close()
 
 
 # ---------------------------------------------------------------- last run / cache keys
@@ -616,18 +685,20 @@ def stage_keys(final_path, l1_path, out, area_crs, a):
     return k1, k2, k3
 
 
+KEY_NAMES = {"final": "FINAL file", "l1": "L1 file", "assume_crs": "assume coordinate system", "epsg": "projection",
+             "rule": "sliver rule", "sliver_acres": "sliver size", "overlay": "overlay stage"}
+
+
 def describe_changes(old, new):
-    names = {"final": "FINAL file", "l1": "L1 file", "version": "script cache version", "assume_crs": "assume CRS",
-             "epsg": "projection", "rule": "sliver rule", "sliver_acres": "sliver size", "overlay": "overlay stage"}
-    return ", ".join(f"{names.get(k, k)}" for k in sorted(set(old) | set(new)) if old.get(k) != new.get(k))
+    return pc.describe_changes(old, new, KEY_NAMES)
 
 
 # ---------------------------------------------------------------- run
 def run(final, l1_path, out, sliver_acres=0.2, rule=True, utm=None, classes="both", workers=None,
         max_memory_gb=None, memory_buffer_gb=None, clean=False, allow_non_utm=False, assume_crs=False,
-        max_chunk_polygons=None, summary_line=False):
+        max_chunk_polygons=None, summary_line=False, processes=None, threads=None):
     final, l1_path, out = Path(final).resolve(), Path(l1_path).resolve(), Path(out).resolve()
-    pc._T0[0] = t_start = time.time()
+    pc.start_clock()
     if out.suffix.lower() not in (".shp", ".gpkg"):
         raise UserError("the output must end with .shp or .gpkg")
     if not out.parent.is_dir():
@@ -656,13 +727,16 @@ def run(final, l1_path, out, sliver_acres=0.2, rule=True, utm=None, classes="bot
                         f"Close it in ArcMap/QGIS and run again, or choose another output name.")
     ans = {"rule": bool(rule), "sliver_acres": float(sliver_acres), "classes": classes, "assume_crs": bool(assume_crs)}
     work = out.parent / (out.stem + "_work")
+    prev_last = load_last_run()     # read before it is replaced: its work folder may be reusable
     last = {"final": str(final), "l1": str(l1_path), "out": str(out),
             "utm": f"EPSG:{area_crs.to_epsg()}" if area_crs.to_epsg() else area_crs.to_wkt(),
-            "work": str(work), "answers": ans, "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "work": str(work), "data_work": str(work), "answers": ans, "started": time.strftime("%Y-%m-%d %H:%M:%S"),
             "status": "running", "progress": "starting", "pid": os.getpid(), "allow_non_utm": bool(allow_non_utm)}
     save_last_run(last)
 
-    def progress(msg, status="running"):
+    def progress(msg, status="running", data_work=None):
+        if data_work is not None:   # the folder that really holds the saved stage results
+            last["data_work"] = str(data_work)
         last.update(progress=msg, status=status, updated=time.strftime("%Y-%m-%d %H:%M:%S"))
         save_last_run(last)
 
@@ -670,69 +744,132 @@ def run(final, l1_path, out, sliver_acres=0.2, rule=True, utm=None, classes="bot
     lock = pc.acquire_lock(work)
     try:
         result = _run_locked(final, l1_path, out, work, wcrs, area_crs, ans, workers, max_memory_gb,
-                             memory_buffer_gb, clean, progress, t_start, max_chunk_polygons, summary_line)
+                             memory_buffer_gb, clean, progress, max_chunk_polygons, summary_line,
+                             processes, threads, prev_last)
     except KeyboardInterrupt:
         pc.release_lock(lock)
+        pc.release_foreign_locks()
         progress("stopped by the user", "interrupted")
         raise
     except BaseException as e:
         pc.release_lock(lock)
+        pc.release_foreign_locks()
         progress(f"{type(e).__name__}: {e}"[:300], "failed")
         raise
     pc.release_lock(lock)
+    pc.release_foreign_locks()
     if clean and result.get("written") == str(out):
         clean_work(work, 1, remove_folder=True)
     progress("finished", "finished")
     return result
 
 
-def _plan_machine(workers, max_memory_gb, memory_buffer_gb):
-    cores, (avail, total) = pc.n_cpus(), pc.memory_status()
-    buf = pc.memory_buffer_bytes(total, memory_buffer_gb)
-    budget = int(max_memory_gb * 1024 ** 3) if max_memory_gb else max(avail - buf, 256 * 1024 ** 2)
-    w = workers or cores
-    w = max(1, min(w, 61 if os.name == "nt" else w, int(budget // (WORKER_BASE_BYTES + 64 * 1024 ** 2)) or 1))
-    return cores, avail, buf, budget, w
+def _read_manifest(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except Exception:
+        return None
 
 
 def _run_locked(final, l1_path, out, work, wcrs, area_crs, ans, workers, max_memory_gb, memory_buffer_gb,
-                clean, progress, t_start, max_chunk_polygons, summary_line=False):
+                clean, progress, max_chunk_polygons, summary_line=False, processes=None, threads=None,
+                prev_last=None):
     k1i, k2i, k3i = stage_keys(final, l1_path, out, area_crs, ans)
     k1, k2, k3 = pc._hash(k1i), pc._hash(k2i), pc._hash(k3i)
     man_path = work / "manifest.json"
-    man = None
-    if man_path.exists():
-        try:
-            man = json.loads(man_path.read_text())
-        except Exception:
-            man = None
+    man = _read_manifest(man_path) if man_path.exists() else None
     if man is None or man.get("k1") != k1:
         if man is not None or any(_OURS.match(f.name) or f.name in ("s1", "s2") for f in work.iterdir()):
-            why = describe_changes(man.get("k1_items", {}), k1i) if man else "work folder unreadable"
-            print(f"Inputs changed since the saved overlay ({why}): everything is recomputed.")
+            if man is None:
+                print("The saved work in this folder cannot be read; everything is recomputed.")
+            else:
+                older, why = pc.explain_changes(man.get("k1_items"), k1i, KEY_NAMES)
+                if older:
+                    print("This work folder was made by an older version of the tool; its saved results cannot be "
+                          "reused.")
+                else:
+                    print("Inputs changed since the saved overlay: " + " ".join(why) + " Everything is recomputed.")
         clean_work(work, 1)
         man = {"k1": k1, "k1_items": k1i}
         pc._write_json(man_path, man)
     elif man.get("k2") != k2:
         if man.get("k2"):
-            print(f"Classification settings changed ({describe_changes(man.get('k2_items', {}), k2i)}): "
-                  f"the saved overlay is reused, classification and writing run again.")
+            _, why = pc.explain_changes(man.get("k2_items"), k2i, KEY_NAMES)
+            print(" ".join(why) + " The saved overlay stays valid; the later stages follow the new setting.")
         clean_work(work, 2)
+    if man.get("overlay_done"):
+        remove_valid_inputs(work)          # left by an older version of the tool
     tol = tolerance_of(wcrs)
-    cores, avail, buf, budget, w = _plan_machine(workers, max_memory_gb, memory_buffer_gb)
-    stats = {}
+    cores, avail, buf, budget, want, mode = plan_machine(workers, max_memory_gb, memory_buffer_gb)
+    print(f"Machine: {cores} cores, {avail / 1024 ** 3:.1f} GB memory free -> using up to {budget / 1024 ** 3:.1f} GB "
+          f"(memory mode: {mode}, {buf / 1024 ** 3:.1f} GB kept free)")
     times, notes = {}, []
 
     def stage(key, msg):
-        t0 = pc._T0[0]
-        tick(msg)
-        times[key] = times.get(key, 0.0) + pc._T0[0] - t0
+        times[key] = times.get(key, 0.0) + tick(msg)
+
+    def show_plan(cinfo):
+        """Plan line (once) and the layout of the chunk stages."""
+        if "layout" not in times_plan:
+            task_b = max(int(cinfo["per_worker"]) - WORKER_BASE_BYTES, 1)
+            p, t = plan_layout(len(cinfo["chunks"]), task_b, budget, want, cores, processes, threads)
+            k = max(1, min(p * t, len(cinfo["chunks"]) or 1))
+            lay = f"{p} process{'es' if p > 1 else ''} x {t} thread{'s' if t > 1 else ''}"
+            print(f"Plan: {lay} = {pc.plural(k, 'chunk')} at a time, {pc.plural(len(cinfo['chunks']), 'chunk')} "
+                  f"of L1 polygons (biggest chunk about {cinfo['per_worker'] / 1024 ** 3:.2f} GB)")
+            if mode == "desktop" and not max_memory_gb and p < min(k, cores) and not (processes or threads):
+                print(f"NOTE: {pc.LOW_MEMORY_NOTE}")
+            times_plan["layout"] = (p, t)
+        return times_plan["layout"]
+
+    times_plan = {}
+    stage("plan", "plan (inputs and work folder checked)")
+
+    # ---- nothing to do: the output is up to date
+    if man.get("k3") == k3 and out.exists() and man.get("stats"):
+        print(f"The output {out.name} was already up to date for these settings; nothing was written again.")
+        progress("finished (up to date)", "finished")
+        return _finish(man["stats"], man.get("written_stats", {}), ans, out, work, clean, times, notes,
+                       area_crs, summary_line)
+
+    # ---- where the saved stage results are: this folder, or the folder of an earlier run
+    classified = work / "classified.bin"
+    have_classes = man.get("k2") == k2 and classified.exists() and bool(man.get("stats"))
+    src = None
+    if not have_classes and not man.get("overlay_done") and not (work / "s1").is_dir() \
+            and not (work / "chunks.bin").exists():
+        src = pc.find_reusable_work(work, k1, None, [man.get("overlay_from"), (prev_last or {}).get("data_work"),
+                                                     (prev_last or {}).get("work")],
+                                    key_name="k1", needed=("chunks.bin", "clusters.bin"), marker=MARKER,
+                                    check=lambda c, m: bool(m.get("overlay_done")) and s1_complete(c))
+        if src is not None:
+            print(f"Reusing saved work from {src}")
+            progress("reusing saved work", data_work=src)
+            man["overlay_from"] = str(src)
+            pc._write_json(man_path, man)
+    stats = man.get("stats") if have_classes else None
+    if not have_classes and src is not None:
+        # saved classes for these settings: in the folder that holds the overlay, or in the previous
+        # run's own folder (which may have read its overlay from there)
+        for c in dict.fromkeys([src, Path((prev_last or {}).get("work") or src).resolve()]):
+            sman = _read_manifest(c / "manifest.json") or {}
+            if c != work.resolve() and (c / MARKER).exists() and sman.get("k1") == k1 and sman.get("k2") == k2 \
+                    and (c / "classified.bin").exists() and sman.get("stats"):
+                if c != src:
+                    try:
+                        pc._FOREIGN_LOCKS.append(pc.acquire_lock(c))
+                    except UserError:
+                        continue
+                classified, stats, have_classes = c / "classified.bin", sman["stats"], True
+                break
+    home = src or work                     # folder that holds chunks.bin, clusters.bin and s1/
+    s1 = home / "s1"
+    chunks_bin = home / "chunks.bin"
 
     # ---- stage 1: prepare + overlay
-    s1 = work / "s1"
-    chunks_bin = work / "chunks.bin"
-    if not man.get("overlay_done"):
-        if not chunks_bin.exists():
+    if not have_classes and src is None and not man.get("overlay_done"):
+        l1v, fv = work / "l1_valid.gpkg", work / "final_valid.gpkg"
+        if not (chunks_bin.exists() and l1v.exists() and fv.exists()):
             need = 4 * sum(q.stat().st_size for p in (final, l1_path) for q in pc._sig_paths(p, "l1") if q.exists())
             free = shutil.disk_usage(out.parent).free
             if need + 50 * 1024 ** 2 > free:
@@ -741,83 +878,75 @@ def _run_locked(final, l1_path, out, work, wcrs, area_crs, ans, workers, max_mem
                 e.needed, e.free = need, free
                 raise e
             progress("reading inputs")
-            l1 = pc.load_l1(l1_path, wcrs, workers=w)
-            fg = pc.load_l1(final, wcrs, workers=w)
+            l1 = pc.load_l1(l1_path, wcrs, workers=want)
+            fg = pc.load_l1(final, wcrs, workers=want)
             stage("read", f"inputs read, reprojected to the working CRS and made valid: {len(l1):,} L1 polygons, "
                           f"{len(fg):,} FINAL polygons")
-            chunks, boxes, per_worker = plan_chunks(l1, fg, w, budget, max_chunk_polygons)
-            write_valid(work / "l1_valid.gpkg", l1, wcrs, lid=True)
-            write_valid(work / "final_valid.gpkg", fg, wcrs)
-            pc._save({"chunks": chunks, "boxes": boxes, "per_worker": per_worker, "n_l1": len(l1)}, chunks_bin)
+            if not chunks_bin.exists():
+                chunks, boxes, per_worker = plan_chunks(l1, fg, want, budget, max_chunk_polygons)
+                pc._save({"chunks": chunks, "boxes": boxes, "per_worker": per_worker, "n_l1": len(l1)}, chunks_bin)
+            write_valid(l1v, l1, wcrs, lid=True)
+            write_valid(fv, fg, wcrs)
             del l1, fg
         cinfo = pc._load(chunks_bin)
-        chunks, boxes = cinfo["chunks"], cinfo["boxes"]
-        w1 = max(1, min(w, int(budget // max(cinfo["per_worker"], 1)) or 1, len(chunks) or 1))
-        print(f"machine: {cores} cores, {avail / 1024 ** 3:.1f} GB available, buffer {buf / 1024 ** 3:.1f} GB, "
-              f"budget {budget / 1024 ** 3:.1f} GB -> {w1} workers, {len(chunks)} chunks of L1 polygons "
-              f"(biggest chunk about {cinfo['per_worker'] / 1024 ** 3:.2f} GB)")
+        p, t = show_plan(cinfo)
         s1.mkdir(exist_ok=True)
-        tasks = [{"l1": str(work / "l1_valid.gpkg"), "final": str(work / "final_valid.gpkg"), "lids": c,
-                  "bbox": bx, "tol": tol, "path": str(s1 / f"c{i:06d}.s1")} for i, (c, bx) in enumerate(zip(chunks, boxes))]
+        tasks = [{"l1": str(l1v), "final": str(fv), "lids": c, "bbox": bx, "tol": tol,
+                  "path": str(s1 / f"c{i:06d}.s1")} for i, (c, bx) in enumerate(zip(cinfo["chunks"], cinfo["boxes"]))]
         progress("overlay")
-        run_pool(chunk_overlay, tasks, w1, buf, "overlay", progress)
-        stage("overlay", "stage 1 overlay (clip, erase, touches remaining)")
+        run_pool(chunk_overlay, tasks, p, t, buf, "overlay", mode, progress)
         pairs = []
-        for t in tasks:
-            pairs += pc._load(t["path"])["overlaps"]
-        pc._save(l1_clusters(work / "l1_valid.gpkg", pairs, tol), work / "clusters.bin")
+        for task in tasks:
+            pairs += pc._load(task["path"])["overlaps"]
+        pc._save(l1_clusters(l1v, pairs, tol), work / "clusters.bin")
         man["overlay_done"] = True
         pc._write_json(man_path, man)
-    else:
+        remove_valid_inputs(work)          # only stage 1 reads them; a rerun of stage 1 makes them again
+        stage("overlay", "stage 1 overlay (clip, erase, touches remaining)")
+    elif not have_classes and src is None:
         print("reusing the saved overlay (stage 1)")
-        notes.append("saved overlay")
-    cinfo = pc._load(chunks_bin)
-    chunks, boxes = cinfo["chunks"], cinfo["boxes"]
 
     # ---- stage 2: classes, dissolve, areas
-    classified = work / "classified.bin"
-    if not (man.get("k2") == k2 and classified.exists()):
+    if not have_classes:
+        cinfo = pc._load(chunks_bin)
         man["k2"], man["k2_items"] = k2, k2i
         man.pop("k3", None)
+        man.pop("stats", None)
         pc._write_json(man_path, man)
         s2 = work / "s2"
         s2.mkdir(exist_ok=True)
-        m = 4 * tol
-        tasks = [{"s1": str(s1 / f"c{i:06d}.s1"), "l1": str(work / "l1_valid.gpkg"), "tol": tol,
-                  "work_crs": wcrs.to_wkt(), "area_crs": area_crs.to_wkt(), "rule": ans["rule"],
-                  "sliver_acres": ans["sliver_acres"], "bbox_pad": (bx[0] - m, bx[1] - m, bx[2] + m, bx[3] + m),
-                  "path": str(s2 / f"c{i:06d}.s2")} for i, bx in enumerate(boxes)]
-        w2 = max(1, min(w, int(budget // max(cinfo["per_worker"], 1)) or 1, len(tasks) or 1))
+        tasks = [{"s1": str(s1 / f"c{i:06d}.s1"), "tol": tol, "work_crs": wcrs.to_wkt(), "area_crs": area_crs.to_wkt(),
+                  "rule": ans["rule"], "sliver_acres": ans["sliver_acres"], "path": str(s2 / f"c{i:06d}.s2")}
+                 for i in range(len(cinfo["chunks"]))]
+        p, t = show_plan(cinfo)
         progress("classes")
-        run_pool(chunk_classes, tasks, w2, buf, "classes", progress)
+        run_pool(chunk_classes, tasks, p, t, buf, "classes", mode, progress)
         stage("rule", "stage 2 sliver rule and areas per chunk")
         progress("dissolve")
-        stats = finish_classes(tasks, work, wcrs, area_crs, tol, w, budget)
+        stats = finish_classes(tasks, work, home / "clusters.bin", wcrs, area_crs, tol, want, budget)
         stage("dissolve", f"dissolve of pieces on L1 seams: {stats['seam_in']:,} pieces -> {stats['seam_out']:,}")
         man["stats"] = stats
         pc._write_json(man_path, man)
         _clean_dir(s2)
-    else:
+    elif classified.parent == work:
         print("reusing the saved classes (stage 2)")
-        notes.append("saved classes")
-        stats = man["stats"]
 
     # ---- stage 3: write
-    if man.get("k3") == k3 and out.exists():
-        print(f"output {out.name} is already up to date for these settings")
-        notes.append("output")
-        written, wst = out, man.get("written_stats", {})
-    else:
-        progress("writing output")
-        wst, written, note = write_output(classified, out, wcrs, CLASS_CHOICES[ans["classes"]], w)
-        stage("write", f"stage 3 write {written}")
-        if note:
-            print(f"NOTE: {note}")
-        if written == out:
-            man["k3"], man["written_stats"] = k3, wst
-            pc._write_json(man_path, man)
+    progress("writing output")
+    wst, written, note = write_output(classified, out, wcrs, CLASS_CHOICES[ans["classes"]], want)
+    stage("write", f"stage 3 write {written}")
+    if note:
+        notes.append(note)
+    if written == out:
+        man["k3"], man["written_stats"], man["stats"] = k3, wst, stats
+        pc._write_json(man_path, man)
+    return _finish(stats, wst, ans, written, work, clean, times, notes, area_crs, summary_line,
+                   classified.parent if classified.parent != work else None)
+
+
+def _finish(stats, wst, ans, written, work, clean, times, notes, area_crs, summary_line, reused_from=None):
     print_summary(stats, wst, ans, out=written, work=work, clean=clean, times=times, notes=notes,
-                  total_s=time.time() - t_start, area_crs=area_crs, summary_line=summary_line)
+                  total_s=pc.run_seconds(), area_crs=area_crs, summary_line=summary_line, reused_from=reused_from)
     res = dict(stats)
     res.update(written=str(written), written_stats=wst)
     return res
@@ -851,7 +980,7 @@ def l1_clusters(l1_valid, pairs, tol):
             [pc.to_wkb(np.array([geo[x] for x in g], dtype=object)) for g in members]}
 
 
-def finish_classes(tasks, work, wcrs, area_crs, tol, workers, budget):
+def finish_classes(tasks, work, clusters_path, wcrs, area_crs, tol, workers, budget):
     """Collect the chunk results, dissolve the seam pieces, drop noise and save classified.bin."""
     st = {"pieces": 0, "touching": 0, "touching_acres": 0.0, "absorbed": 0, "absorbed_acres": 0.0,
           "l1_m2_sum": 0.0, "noise_overlay": 0, "noise_overlay_m2": 0.0}
@@ -871,7 +1000,7 @@ def finish_classes(tasks, work, wcrs, area_crs, tol, workers, budget):
     if budget and nbytes * 8 > budget:
         raise UserError(f"the pieces on L1 seams need about {nbytes * 8 / 1024 ** 3:.1f} GB to dissolve, more than "
                         f"the memory budget; raise --max-memory-gb")
-    cl = pc._load(work / "clusters.bin")
+    cl = pc._load(clusters_path)
     l1_m2 = st["l1_m2_sum"]
     for g_wkb, u_wkb in zip(cl.get("geoms_wkb", []), cl["wkb"]):   # union of overlapping L1 = sum - overlaps
         members = float(area_m2(shapely.from_wkb(g_wkb), wcrs, area_crs).sum())
@@ -968,46 +1097,6 @@ def write_output(classified, out, wcrs, classes, workers, batch=200_000):
     return res, written, note
 
 
-def _rows(text, width=88):
-    return [(x,) for x in _wrap(text, width)]
-
-
-def _wrap(text, width=88):
-    """One row per wrapped line: two spaces indent, hanging indent of two more on the next lines."""
-    import textwrap
-    return list(textwrap.wrap(text, width, initial_indent="  ", subsequent_indent="    "))
-
-
-def print_result_block(title, sections):
-    """Print a titled block. sections = [(heading, rows)]; a row is a tuple of strings.
-    Rows with 2+ cells are aligned in columns (first cell left, the next two right-aligned, any further cell
-    left as free text); a row with one cell is printed as it is. An empty heading prints no heading line."""
-    wid = [0, 0, 0]
-    for _, rows in sections:
-        for r in rows:
-            if len(r) > 1:
-                for i in range(min(len(r), 3)):
-                    wid[i] = max(wid[i], len(r[i]))
-    lines = []
-    for heading, rows in sections:
-        if lines:
-            lines.append("")
-        if heading:
-            lines.append(heading)
-        for r in rows:
-            if len(r) == 1:
-                lines.append(r[0])
-                continue
-            cells = [r[0].ljust(wid[0])] + [c.rjust(wid[i]) for i, c in enumerate(r[1:3], 1)]
-            line = "  ".join(cells) + "".join("  " + c for c in r[3:])
-            lines.append(line.rstrip())
-    width = max([48] + [len(x) for x in lines if len(x) <= 90])
-    head = f" {title} "
-    print("=" * ((width - len(head)) // 2) + head + "=" * (width - len(head) - (width - len(head)) // 2))
-    print("\n".join(lines))
-    print("=" * width)
-
-
 def _folder_size(p):
     total = 0
     for f in Path(p).rglob("*"):
@@ -1017,13 +1106,6 @@ def _folder_size(p):
         except OSError:
             pass
     return total
-
-
-def _human_size(n):
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
-            return f"{n:,.0f} {unit}" if unit == "B" else f"{n:,.1f} {unit}"
-        n /= 1024
 
 
 def _summary_lines(st, wst, ans):
@@ -1045,19 +1127,17 @@ def _summary_lines(st, wst, ans):
 
 
 def print_summary(st, wst, ans, out=None, work=None, clean=False, times=None, notes=(), total_s=None, area_crs=None,
-                  summary_line=False):
+                  summary_line=False, reused_from=None):
+    """NOTE lines, the RESULT block and, with --summary-line, the SUMMARY lines. Lines about reused
+    work are printed while the run goes, not repeated here."""
+    for x in notes or ():
+        print(f"NOTE: {x}")
     a81, a82, ul = st["acres81"], st["acres82"], st["l1_union_acres"]
     diff = a81 + a82 - ul
     pct = 100 * diff / ul if ul else 0.0
     ok = abs(pct) <= 0.01
     n = lambda v: f"{v:,}"          # noqa: E731
-    ac = lambda v: f"{v:,.3f}"      # noqa: E731
-    if notes:
-        parts = [x for x in notes if x != "output"]
-        if parts:
-            print("Reused from an earlier run: " + " and ".join(parts) + ".")
-        if "output" in notes:
-            print("The output file was already up to date for these settings; nothing was written again.")
+    ac = pc.acres_text
     table = [("Class", "Polygons", "Acres"),
              ("  81  Remaining cane", n(st["n81"]), ac(a81)),
              ("  82  Harvested", n(st["n82"]), ac(a82)),
@@ -1067,18 +1147,20 @@ def print_summary(st, wst, ans, out=None, work=None, clean=False, times=None, no
         w_sum = sum(wst[f"acres{c}"] for c in classes)
         exact = sum({REMAIN: a81, HARVEST: a82}[c] for c in classes)
         if abs(w_sum - exact) > 0.001:
-            table.extend(_rows(f"Note: adding up the area_ac column of the file gives {ac(w_sum)} acres "
-                               f"(each polygon is rounded to 3 decimals)."))
+            table.extend(pc.wrap_rows(f"Note: adding up the area_ac column of the file gives {ac(w_sum)} acres "
+                                      f"(each polygon is rounded to 3 decimals)."))
     check = [("  L1 area", "", ac(ul)),
              ("  Difference", "", ac(diff), f"({abs(pct):.4f} %)  {'OK' if ok else 'CHECK'}")]
     if not ok:
-        check.extend(_rows(f"WARNING: 81 + 82 differs from the area of L1 by {pct:.4f} % (more than 0.01 %)"))
+        check.extend(pc.wrap_rows(f"WARNING: 81 + 82 differs from the area of L1 by {pct:.4f} % (more than 0.01 %)"))
     if st["l1_overlap_groups"]:
-        check.extend(_rows(f"L1 polygons overlap each other in {st['l1_overlap_groups']:,} places; the overlap is "
-                           f"counted once, as remaining cane where both classes meet."))
+        g = st["l1_overlap_groups"]
+        check.extend(pc.wrap_rows(f"L1 polygons overlap each other in {pc.plural(g, 'place')}; the overlap is "
+                                  f"counted once, as remaining cane where both classes meet."))
     if st["trimmed_82_pieces"]:
-        check.extend(_rows(f"{st['trimmed_82_pieces']:,} harvested pieces were cut back where they overlapped "
-                           f"remaining cane."))
+        k = st["trimmed_82_pieces"]
+        check.extend(pc.wrap_rows(f"{pc.plural(k, 'harvested piece')} {'was' if k == 1 else 'were'} cut back where "
+                                  f"{'it' if k == 1 else 'they'} overlapped remaining cane."))
     noise = ("  Numerical noise removed", n(st["noise_overlay"] + st["noise"]), f"{st['noise_overlay_m2'] / ACRE_M2:.3f}")
     if ans["rule"]:
         small = [(f"Small harvested pieces (rule: {ans['sliver_acres']} acres or smaller AND touching remaining cane)",
@@ -1087,9 +1169,7 @@ def print_summary(st, wst, ans, out=None, work=None, clean=False, times=None, no
                    ("  Changed to remaining cane", n(st["absorbed"]), ac(st["absorbed_acres"])), noise])]
     else:
         small = [("Cleaning (sliver rule is off)", [noise])]
-    crs_txt = area_crs.name if area_crs is not None else "?"
-    if area_crs is not None and area_crs.to_epsg():
-        crs_txt += f" (EPSG:{area_crs.to_epsg()})"
+    crs_txt = pc.crs_label(area_crs) if area_crs is not None else "?"
     settings = [("  Sliver rule : " + (f"on, pieces of {ans['sliver_acres']} acres or smaller" if ans["rule"] else "off"),),
                 (f"  Projection  : {crs_txt}",),
                 ("  Classes     : " + {"both": "both (81 and 82)", "81": "81 only", "82": "82 only"}[ans["classes"]],)]
@@ -1099,21 +1179,25 @@ def print_summary(st, wst, ans, out=None, work=None, clean=False, times=None, no
         if ans["classes"] != "both":
             cnt += f", class {ans['classes']} only"
         files.append((f"  Output : {out}   ({cnt})",))
-        if clean:
+        if reused_from is not None:
+            files.append((f"  Cache  : read from {reused_from} ({pc.human_size(_folder_size(reused_from))}); "
+                          f"that folder was not changed.",))
+        elif clean:
             files.append(("  Cache  : removed after the run (--clean)",))
         elif work is not None:
-            files.append((f"  Cache  : {work} ({_human_size(_folder_size(work))})",))
-            files.append(("           A rerun that only changes the sliver rule, the projection or the classes reuses it.",))
-            big = " It is large; delete it when you no longer need quick reruns." if _folder_size(work) > 500 * 1024 ** 2 else ""
+            size = _folder_size(work)
+            files.append((f"  Cache  : {work} ({pc.human_size(size)})",))
+            files.append(("           A rerun that only changes the sliver rule, the projection, the classes or the "
+                          "output name reuses it.",))
+            big = " It is large; delete it when you no longer need quick reruns." if size > 500 * 1024 ** 2 else ""
             files.append(("           Safe to delete." + big,))
     sections = [("", table), ("Area check (remaining + harvested must equal L1)", check)] + small
     sections += [("Settings used", settings), ("Files", files)]
     if total_s is not None:
-        names = (("read", "read"), ("overlay", "overlay"), ("rule", "rule and areas"), ("dissolve", "dissolve"),
-                 ("write", "write"))
-        parts = " | ".join(f"{lab} {times[k]:.1f}" for k, lab in names if times and k in times)
-        sections.append(("", [(f"Time     : {total_s:.1f} s" + (f"  ({parts})" if parts else ""),)]))
-    print_result_block("RESULT", sections)
+        names = (("plan", "plan"), ("read", "read"), ("overlay", "overlay"), ("rule", "rule and areas"),
+                 ("dissolve", "dissolve"), ("write", "write"))
+        sections.append(("", [(pc.time_line(times, total_s, names),)]))
+    pc.print_result_block("RESULT", sections)
     if summary_line:
         _summary_lines(st, wst, ans)
 
@@ -1130,69 +1214,10 @@ def made_by_this_tool(p):
         return False
 
 
-_BAD_CHARS = set('<>:"/\\|?*')
-_RESERVED = {"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)}
-
-
-def _name_check(a):
-    a = a.strip()
-    if Path(a).suffix.lower() in (".shp", ".gpkg"):
-        a = a[:-len(Path(a).suffix)]
-    bad = sorted({c for c in a if c in _BAD_CHARS or ord(c) < 32})
-    if not a:
-        return None, "Type a name."
-    if bad:
-        return None, f"A file name cannot contain {' '.join(bad)} (Windows rule). Use letters, digits, - or _."
-    if a[-1] in ". " or a.split(".")[0].lower() in _RESERVED:
-        return None, "This name is not allowed on Windows (reserved word, or ends with a dot or space)."
-    return a, None
-
-
 def ask_output(default_dir, default_stem, defaults):
-    """Three questions: output folder, name (no extension), format. Returns the output Path.
-    A full file path pasted as the folder is split into folder, name and format."""
-    prev = Path(defaults["out"]) if defaults and defaults.get("out") else None
-    folder_def = str(prev.parent if prev else default_dir)
-    stem_def = prev.stem if prev else default_stem
-    fmt_def = "2" if (prev and prev.suffix.lower() == ".gpkg") else "1"
-    while True:
-        raw = pc.clean_path(pc.ask_text("   Output folder", folder_def))
-        folder = Path(raw)
-        if folder.suffix.lower() in (".shp", ".gpkg"):
-            stem_def, fmt_def = folder.stem, "2" if folder.suffix.lower() == ".gpkg" else "1"
-            folder = folder.parent
-        if folder.exists() and not folder.is_dir():
-            print(f"  {folder} is a file, not a folder.")
-            continue
-        if not folder.exists():
-            if not pc.ask_yes_no(f"   The folder {folder} does not exist. Create it?", True):
-                continue
-            try:
-                folder.mkdir(parents=True)
-            except OSError as e:
-                print(f"  Cannot create it: {e}")
-                continue
-        if not pc.folder_writable(folder):
-            print(f"  Cannot write in {folder}. Choose another folder.")
-            continue
-        free = shutil.disk_usage(folder).free
-        if free < 200 * 1024 ** 2:
-            print(f"  Only {free / 1024 ** 2:.0f} MB free in {folder}. Choose a folder on a disk with more space.")
-            continue
-        break
-    while True:
-        stem = pc.ask_text("   Output name", stem_def, _name_check)
-        print("   A shapefile cannot be larger than 2 GB; choose 2 for very large areas.")
-        fmt = pc.ask_text("   Save as:  1) Shapefile (.shp)   2) GeoPackage (.gpkg) ", fmt_def,
-                          lambda a: (a.strip(), None) if a.strip() in ("1", "2") else (None, "Type 1 or 2."))
-        out = folder / (stem + (".shp" if fmt == "1" else ".gpkg"))
-        if out.exists():
-            if made_by_this_tool(out):
-                if not pc.ask_yes_no(f"   {out.name} was made by an earlier run of this tool. Replace it?", True):
-                    continue
-            elif not pc.ask_yes_no(f"   {out.name} already exists. Overwrite?", False):
-                continue
-        return out
+    """Output folder, name (no extension) and format: the shared questions of preprocess_classified.py
+    (an existing output of an earlier run of THIS tool is offered for replacement)."""
+    return pc.ask_output(default_dir, default_stem, defaults, made_by=made_by_this_tool)
 
 
 def _classes_check(a):
@@ -1220,7 +1245,6 @@ def interactive(defaults):
         if not pc.ask_yes_no(f"   Assume it uses the same coordinate system as the {other} layer?", False):
             raise SystemExit(f"Stopped: give the {which} layer a coordinate system and run again.")
         assume = True
-    print("3) Output")
     out = ask_output(final.parent, final.stem + "_harvest_final", defaults)
     rule = pc.ask_yes_no("4) Turn small harvested pieces that touch remaining cane into remaining cane?",
                          defaults.get("rule", True))
@@ -1286,10 +1310,6 @@ def chunks_progress(work):
 def describe_last(last):
     ans = last.get("answers", {})
     d, n = chunks_progress(last.get("work", ""))
-    try:
-        epsg = pyproj.CRS(last["utm"]).to_epsg()
-    except Exception:
-        epsg = "?"
     state = last.get("status", "?")
     if state == "running" and pc._pid_alive(last.get("pid")) is False:
         state = "interrupted"
@@ -1297,10 +1317,10 @@ def describe_last(last):
     print(f"  FINAL       : {last['final']}\n  L1 layer    : {last['l1']}\n  output      : {last['out']}")
     rule = f"pieces <= {ans.get('sliver_acres')} acres touching remaining -> 81" if ans.get("rule", True) else "off"
     print(f"  sliver rule : {rule}")
-    print(f"  projection  : EPSG:{epsg}")
+    print(f"  projection  : {pc.crs_label(last.get('utm'))}")
     print(f"  classes     : {ans.get('classes', 'both')}")
     extra = f" ({d} of {n} overlay chunks saved)" if n and state != "finished" else ""
-    print(f"  status      : {state}, {last.get('progress', '')}{extra}, started {last.get('started', '?')}")
+    print(f"  status      : {pc.status_text(state, last.get('progress', ''))}{extra}, started {last.get('started', '?')}")
 
 
 def _validate_cli(a, ap):
@@ -1315,8 +1335,10 @@ def _validate_cli(a, ap):
         ap.error(f"--out: folder does not exist: {out.parent}")
     if a.sliver_acres < 0 or not math.isfinite(a.sliver_acres):
         ap.error("--sliver-acres must be 0 or more")
-    if a.workers is not None and a.workers < 1:
-        ap.error("--workers must be 1 or more")
+    for name in ("workers", "processes", "threads"):
+        v = getattr(a, name)
+        if v is not None and v < 1:
+            ap.error(f"--{name} must be 1 or more")
     if a.max_memory_gb is not None and a.max_memory_gb <= 0:
         ap.error("--max-memory-gb must be more than 0")
     if a.memory_buffer_gb is not None and a.memory_buffer_gb < 0:
@@ -1353,23 +1375,34 @@ def main(argv=None):
     ap.add_argument("--allow-non-utm", action="store_true", help="accept a projected CRS that is not a UTM zone")
     ap.add_argument("--assume-crs", action="store_true",
                     help="a layer without coordinate system is taken to be in the other layer's system")
-    ap.add_argument("--workers", type=int, default=None)
+    ap.add_argument("--workers", type=int, default=None, help="chunks processed in parallel (default: all cores)")
+    ap.add_argument("--processes", type=int, default=None,
+                    help="worker processes (default: planned from the memory budget; 1 = threads inside this program)")
+    ap.add_argument("--threads", type=int, default=None,
+                    help="threads per process (default: planned; processes x threads = parallel chunks)")
     ap.add_argument("--max-memory-gb", type=float, default=None,
                     help="memory budget (default: available memory minus the buffer)")
     ap.add_argument("--memory-buffer-gb", type=float, default=None,
-                    help="memory kept free (default 2, or 1.5 on machines with 8 GB RAM or less)")
+                    help="memory kept free (default: 20%% of the available memory, between 0.5 and 1 GB)")
     ap.add_argument("--clean", action="store_true", help="remove the work folder after success")
     ap.add_argument("--summary-line", action="store_true",
                     help="also print the machine-readable SUMMARY key=value lines after the result block")
     ap.add_argument("--ask", action="store_true", help="question-and-answer mode")
     a = ap.parse_args(argv)
     ask = a.ask or len(sys.argv if argv is None else argv) <= (1 if argv is None else 0)
-    common = dict(workers=a.workers, max_memory_gb=a.max_memory_gb, memory_buffer_gb=a.memory_buffer_gb, clean=a.clean)
+    common = dict(workers=a.workers, max_memory_gb=a.max_memory_gb, memory_buffer_gb=a.memory_buffer_gb, clean=a.clean,
+                  processes=a.processes, threads=a.threads)
     if ask:
         try:
             last = load_last_run()
             ans = None
             defaults = dict(final=a.final, l1=a.l1, out=a.out)
+            if last and not pc.last_inputs_exist(last, ("final", "l1")):
+                la = last.get("answers", {})
+                defaults = dict(final=a.final or pc._existing(last.get("final")), l1=a.l1 or pc._existing(last.get("l1")),
+                                out=last["out"], rule=la.get("rule", True), sliver_acres=la.get("sliver_acres", 0.2),
+                                classes=la.get("classes", "both"), utm=last.get("utm"))
+                last = None    # its input files are gone: straight to the questions
             if last:
                 describe_last(last)
                 la = last.get("answers", {})

@@ -25,6 +25,8 @@ _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src" if (_ROOT / "src").is_dir() else _ROOT))
 import preprocess_classified as pc  # noqa: E402
 
+pc.LAST_RUN = Path(tempfile.mkdtemp()) / "last_run.json"   # never touch the user's own last-run record
+
 PX = 0.0001
 ORIGIN = (4.0, 1.0)
 
