@@ -1,6 +1,6 @@
 """Compare three ways of telling harvested from standing cane on each report date, using SAR only.
 
-  rgb3  : the user's idea - VH of the 3 latest passes of the main track (what a 3-date colour composite shows)
+  rgb3  : VH of the 3 latest passes of the main track (what a 3-date colour composite shows)
   drop  : one number - latest VH minus the same pixel's early-season VH (first 3 passes), one threshold
   tree  : small LightGBM on every pass available up to the report date, both tracks, VV and VH
 Truth = the reference reports (harvested by the report date vs still standing). Train and test pixels come from

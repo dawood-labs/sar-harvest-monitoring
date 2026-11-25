@@ -1,4 +1,4 @@
-"""Two ideas from the user, tested on the difference area: rate-of-change features, and teaching the mistakes.
+"""Two ideas, tested on the difference area: rate-of-change features, and teaching the mistakes.
 
 Features
   level   the 28 date-free level features used so far

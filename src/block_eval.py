@@ -1,6 +1,6 @@
 """Score results on PURE BLOCKS of pixels, not on single pixels.
 
-Why (user's rule): a validation sample must be a group of pixels that all have the same class in the original
+Why (project rule): a validation sample must be a group of pixels that all have the same class in the original
 report - all harvested or all standing - and it must be at least half an acre. Single pixels and blocks that
 straddle a field edge are not valid samples, because at 10 m nobody can say what the right answer is there.
 Blocks: the area is cut into squares of 5 x 5 pixels (50 m x 50 m = 0.62 acre). A square is a validation block

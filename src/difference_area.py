@@ -1,4 +1,4 @@
-"""Rank method variants by their DIFFERENCE AREA against the original report (the user's measure of the best model).
+"""Rank method variants by their DIFFERENCE AREA against the original report (the measure of the best model).
 
 Difference area = acres of blocks where the SAR result and the original report disagree, counting only blocks of
 at least MIN_ACRES that are at least 30 m wide (thin edge strips and stray pixels are not counted):
