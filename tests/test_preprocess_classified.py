@@ -225,8 +225,10 @@ def test_tile_halo_equals_whole():
 
 def test_memory_buffer():
     gb = 1024 ** 3
-    assert pc.memory_buffer_bytes(16 * gb) == 2 * gb
-    assert pc.memory_buffer_bytes(8 * gb) == int(1.5 * gb)
+    # owner rule: buffer = clamp(20 % of available, 0.5 GB, 1 GB); budget = available - buffer
+    for avail, want_budget in ((2.5, 2.0), (12, 11.0), (16, 15.0), (1.0, 0.5), (5.0, 4.0)):
+        buf = pc.memory_buffer_bytes(16 * gb, None, int(avail * gb))
+        assert abs((avail * gb - buf) / gb - want_budget) < 1e-6, (avail, buf / gb)
     assert pc.memory_buffer_bytes(16 * gb, 3) == 3 * gb
     assert pc.memory_status()[0] >= 0
 
@@ -512,7 +514,7 @@ def test_question_mode_projection_default():
     import tempfile
     d = Path(tempfile.mkdtemp())
     r, l1 = _small_case(d)                                             # data centre in UTM zone 31N
-    answers = [str(r), str(l1), str(d / "new.gpkg"), "", "", "", "", "", "n"]
+    answers = [str(r), str(l1), str(d / "new.gpkg"), "", "", "", "", "", "", "", "n"]   # folder, name, format
     for prev, want in (("EPSG:32647", "[1]:"), ("EPSG:32632", "[EPSG:32632]:"), ("EPSG:32631", "[EPSG:32631]:")):
         res, txt = _piped(pc.interactive, answers, dict(utm=prev))
         line = [x for x in txt.split("\n") if "Choose number, zone" in x][0]
