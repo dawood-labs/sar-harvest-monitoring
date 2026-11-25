@@ -162,7 +162,7 @@ def test_overlapping_l1_polygons():
     l1 = [B(0, 0, 100, 100), B(50, 0, 150, 100)]
     final = [B(0, 0, 100, 97)]
     g81, g82, txt, _ = check(final, l1)
-    assert "overlapping_L1_groups=1" in txt
+    assert "L1 polygons overlap each other in 1 places" in txt
 
 
 def test_invalid_holes_multipart():
@@ -327,3 +327,29 @@ if __name__ == "__main__":
         if name.startswith("test_"):
             fn()
             print("ok", name, flush=True)
+
+
+def _num(x):
+    return float(x.replace(",", ""))
+
+
+def test_result_block_and_summary_line():
+    final, l1 = random_case(2)
+    _, txt, d = run_case(final, l1, sliver_acres=0.2)
+    assert "==================== RESULT" in txt and "SUMMARY" not in txt
+    rows = {}
+    for line in txt.splitlines():
+        for key in ("81  Remaining cane", "82  Harvested", "Total (81 + 82)"):
+            if line.strip().startswith(key):
+                rows[key] = line.split()[-2:]
+    assert len(rows) == 3, txt
+    n81, a81 = (_num(x) for x in rows["81  Remaining cane"])
+    n82, a82 = (_num(x) for x in rows["82  Harvested"])
+    nt, at = (_num(x) for x in rows["Total (81 + 82)"])
+    assert n81 + n82 == nt and abs(a81 + a82 - at) < 0.0015
+    area = [x for x in txt.splitlines() if x.strip().startswith("Difference")]
+    assert area and area[0].rstrip().endswith("OK") and "Area check" in txt and "Time     :" in txt
+    _, txt2, _ = run_case(final, l1, d=d, sliver_acres=0.2, same_inputs=True, summary_line=True)
+    assert "SUMMARY class 81" in txt2 and "already up to date" in txt2 and "RESULT" in txt2
+    _, txt3, _ = run_case(final, l1, d=d, sliver_acres=0.2, rule=False, classes="81", same_inputs=True)
+    assert "Sliver rule : off" in txt3 and "Small harvested pieces" not in txt3 and "class 81 only" in txt3

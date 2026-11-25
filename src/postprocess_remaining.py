@@ -39,7 +39,7 @@ Run without arguments (or with --ask) for a question-and-answer mode; all choice
 available as flags:
     python postprocess_remaining.py --final qc.shp --l1 l1.shp --out result.shp [--sliver-acres 0.2]
         [--no-sliver-rule] [--classes both|81|82] [--utm 47N | EPSG:32647] [--allow-non-utm]
-        [--assume-crs] [--workers N] [--max-memory-gb G] [--memory-buffer-gb B] [--clean]
+        [--assume-crs] [--workers N] [--max-memory-gb G] [--memory-buffer-gb B] [--clean] [--summary-line]
 """
 import argparse
 import json
@@ -625,7 +625,7 @@ def describe_changes(old, new):
 # ---------------------------------------------------------------- run
 def run(final, l1_path, out, sliver_acres=0.2, rule=True, utm=None, classes="both", workers=None,
         max_memory_gb=None, memory_buffer_gb=None, clean=False, allow_non_utm=False, assume_crs=False,
-        max_chunk_polygons=None):
+        max_chunk_polygons=None, summary_line=False):
     final, l1_path, out = Path(final).resolve(), Path(l1_path).resolve(), Path(out).resolve()
     pc._T0[0] = t_start = time.time()
     if out.suffix.lower() not in (".shp", ".gpkg"):
@@ -670,7 +670,7 @@ def run(final, l1_path, out, sliver_acres=0.2, rule=True, utm=None, classes="bot
     lock = pc.acquire_lock(work)
     try:
         result = _run_locked(final, l1_path, out, work, wcrs, area_crs, ans, workers, max_memory_gb,
-                             memory_buffer_gb, clean, progress, t_start, max_chunk_polygons)
+                             memory_buffer_gb, clean, progress, t_start, max_chunk_polygons, summary_line)
     except KeyboardInterrupt:
         pc.release_lock(lock)
         progress("stopped by the user", "interrupted")
@@ -696,7 +696,7 @@ def _plan_machine(workers, max_memory_gb, memory_buffer_gb):
 
 
 def _run_locked(final, l1_path, out, work, wcrs, area_crs, ans, workers, max_memory_gb, memory_buffer_gb,
-                clean, progress, t_start, max_chunk_polygons):
+                clean, progress, t_start, max_chunk_polygons, summary_line=False):
     k1i, k2i, k3i = stage_keys(final, l1_path, out, area_crs, ans)
     k1, k2, k3 = pc._hash(k1i), pc._hash(k2i), pc._hash(k3i)
     man_path = work / "manifest.json"
@@ -721,6 +721,12 @@ def _run_locked(final, l1_path, out, work, wcrs, area_crs, ans, workers, max_mem
     tol = tolerance_of(wcrs)
     cores, avail, buf, budget, w = _plan_machine(workers, max_memory_gb, memory_buffer_gb)
     stats = {}
+    times, notes = {}, []
+
+    def stage(key, msg):
+        t0 = pc._T0[0]
+        tick(msg)
+        times[key] = times.get(key, 0.0) + pc._T0[0] - t0
 
     # ---- stage 1: prepare + overlay
     s1 = work / "s1"
@@ -737,8 +743,8 @@ def _run_locked(final, l1_path, out, work, wcrs, area_crs, ans, workers, max_mem
             progress("reading inputs")
             l1 = pc.load_l1(l1_path, wcrs, workers=w)
             fg = pc.load_l1(final, wcrs, workers=w)
-            tick(f"inputs read, reprojected to the working CRS and made valid: {len(l1):,} L1 polygons, "
-                 f"{len(fg):,} FINAL polygons")
+            stage("read", f"inputs read, reprojected to the working CRS and made valid: {len(l1):,} L1 polygons, "
+                          f"{len(fg):,} FINAL polygons")
             chunks, boxes, per_worker = plan_chunks(l1, fg, w, budget, max_chunk_polygons)
             write_valid(work / "l1_valid.gpkg", l1, wcrs, lid=True)
             write_valid(work / "final_valid.gpkg", fg, wcrs)
@@ -755,7 +761,7 @@ def _run_locked(final, l1_path, out, work, wcrs, area_crs, ans, workers, max_mem
                   "bbox": bx, "tol": tol, "path": str(s1 / f"c{i:06d}.s1")} for i, (c, bx) in enumerate(zip(chunks, boxes))]
         progress("overlay")
         run_pool(chunk_overlay, tasks, w1, buf, "overlay", progress)
-        tick("stage 1 overlay (clip, erase, touches remaining)")
+        stage("overlay", "stage 1 overlay (clip, erase, touches remaining)")
         pairs = []
         for t in tasks:
             pairs += pc._load(t["path"])["overlaps"]
@@ -764,6 +770,7 @@ def _run_locked(final, l1_path, out, work, wcrs, area_crs, ans, workers, max_mem
         pc._write_json(man_path, man)
     else:
         print("reusing the saved overlay (stage 1)")
+        notes.append("saved overlay")
     cinfo = pc._load(chunks_bin)
     chunks, boxes = cinfo["chunks"], cinfo["boxes"]
 
@@ -783,37 +790,34 @@ def _run_locked(final, l1_path, out, work, wcrs, area_crs, ans, workers, max_mem
         w2 = max(1, min(w, int(budget // max(cinfo["per_worker"], 1)) or 1, len(tasks) or 1))
         progress("classes")
         run_pool(chunk_classes, tasks, w2, buf, "classes", progress)
-        tick("stage 2 sliver rule and areas per chunk")
+        stage("rule", "stage 2 sliver rule and areas per chunk")
         progress("dissolve")
         stats = finish_classes(tasks, work, wcrs, area_crs, tol, w, budget)
-        tick(f"dissolve of pieces on L1 seams: {stats['seam_in']:,} pieces -> {stats['seam_out']:,}")
+        stage("dissolve", f"dissolve of pieces on L1 seams: {stats['seam_in']:,} pieces -> {stats['seam_out']:,}")
         man["stats"] = stats
         pc._write_json(man_path, man)
         _clean_dir(s2)
     else:
         print("reusing the saved classes (stage 2)")
+        notes.append("saved classes")
         stats = man["stats"]
 
     # ---- stage 3: write
     if man.get("k3") == k3 and out.exists():
         print(f"output {out.name} is already up to date for these settings")
+        notes.append("output")
         written, wst = out, man.get("written_stats", {})
     else:
         progress("writing output")
         wst, written, note = write_output(classified, out, wcrs, CLASS_CHOICES[ans["classes"]], w)
-        tick(f"stage 3 write {written}")
+        stage("write", f"stage 3 write {written}")
         if note:
             print(f"NOTE: {note}")
         if written == out:
             man["k3"], man["written_stats"] = k3, wst
             pc._write_json(man_path, man)
-    print_summary(stats, wst, ans)
-    if clean:
-        print("work folder removed (--clean)")
-    else:
-        print(f"cache kept in {work}; a rerun that only changes the sliver rule, the projection or the classes "
-              f"reuses it. Remove the folder to free the space (or use --clean).")
-    print(f"TOTAL wall time {time.time() - t_start:.1f}s")
+    print_summary(stats, wst, ans, out=written, work=work, clean=clean, times=times, notes=notes,
+                  total_s=time.time() - t_start, area_crs=area_crs, summary_line=summary_line)
     res = dict(stats)
     res.update(written=str(written), written_stats=wst)
     return res
@@ -964,7 +968,65 @@ def write_output(classified, out, wcrs, classes, workers, batch=200_000):
     return res, written, note
 
 
-def print_summary(st, wst, ans):
+def _rows(text, width=88):
+    return [(x,) for x in _wrap(text, width)]
+
+
+def _wrap(text, width=88):
+    """One row per wrapped line: two spaces indent, hanging indent of two more on the next lines."""
+    import textwrap
+    return list(textwrap.wrap(text, width, initial_indent="  ", subsequent_indent="    "))
+
+
+def print_result_block(title, sections):
+    """Print a titled block. sections = [(heading, rows)]; a row is a tuple of strings.
+    Rows with 2+ cells are aligned in columns (first cell left, the next two right-aligned, any further cell
+    left as free text); a row with one cell is printed as it is. An empty heading prints no heading line."""
+    wid = [0, 0, 0]
+    for _, rows in sections:
+        for r in rows:
+            if len(r) > 1:
+                for i in range(min(len(r), 3)):
+                    wid[i] = max(wid[i], len(r[i]))
+    lines = []
+    for heading, rows in sections:
+        if lines:
+            lines.append("")
+        if heading:
+            lines.append(heading)
+        for r in rows:
+            if len(r) == 1:
+                lines.append(r[0])
+                continue
+            cells = [r[0].ljust(wid[0])] + [c.rjust(wid[i]) for i, c in enumerate(r[1:3], 1)]
+            line = "  ".join(cells) + "".join("  " + c for c in r[3:])
+            lines.append(line.rstrip())
+    width = max([48] + [len(x) for x in lines if len(x) <= 90])
+    head = f" {title} "
+    print("=" * ((width - len(head)) // 2) + head + "=" * (width - len(head) - (width - len(head)) // 2))
+    print("\n".join(lines))
+    print("=" * width)
+
+
+def _folder_size(p):
+    total = 0
+    for f in Path(p).rglob("*"):
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def _human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:,.0f} {unit}" if unit == "B" else f"{n:,.1f} {unit}"
+        n /= 1024
+
+
+def _summary_lines(st, wst, ans):
     a81, a82, ul = st["acres81"], st["acres82"], st["l1_union_acres"]
     diff = a81 + a82 - ul
     pct = 100 * diff / ul if ul else 0.0
@@ -976,12 +1038,84 @@ def print_summary(st, wst, ans):
     print(f"SUMMARY class 81: {st['n81']:,} polygons, {a81:,.3f} acres | class 82: {st['n82']:,} polygons, "
           f"{a82:,.3f} acres | 81 + 82 = {a81 + a82:,.3f} acres | union of L1 = {ul:,.3f} acres | "
           f"difference {diff:,.3f} acres ({pct:.4f} %)")
-    if abs(pct) > 0.01:
-        print(f"WARNING: 81 + 82 differs from the area of L1 by {pct:.4f} % (more than 0.01 %)")
     if wst:
         print(f"SUMMARY written ({ans['classes']}): {wst['count']:,} polygons "
               f"(81: {wst['n81']:,}, {wst['acres81']:,.3f} acres; 82: {wst['n82']:,}, {wst['acres82']:,.3f} acres; "
               f"sums of the rounded area_ac)")
+
+
+def print_summary(st, wst, ans, out=None, work=None, clean=False, times=None, notes=(), total_s=None, area_crs=None,
+                  summary_line=False):
+    a81, a82, ul = st["acres81"], st["acres82"], st["l1_union_acres"]
+    diff = a81 + a82 - ul
+    pct = 100 * diff / ul if ul else 0.0
+    ok = abs(pct) <= 0.01
+    n = lambda v: f"{v:,}"          # noqa: E731
+    ac = lambda v: f"{v:,.3f}"      # noqa: E731
+    if notes:
+        parts = [x for x in notes if x != "output"]
+        if parts:
+            print("Reused from an earlier run: " + " and ".join(parts) + ".")
+        if "output" in notes:
+            print("The output file was already up to date for these settings; nothing was written again.")
+    table = [("Class", "Polygons", "Acres"),
+             ("  81  Remaining cane", n(st["n81"]), ac(a81)),
+             ("  82  Harvested", n(st["n82"]), ac(a82)),
+             ("  Total (81 + 82)", n(st["n81"] + st["n82"]), ac(a81 + a82))]
+    classes = CLASS_CHOICES[ans["classes"]]
+    if wst:
+        w_sum = sum(wst[f"acres{c}"] for c in classes)
+        exact = sum({REMAIN: a81, HARVEST: a82}[c] for c in classes)
+        if abs(w_sum - exact) > 0.001:
+            table.extend(_rows(f"Note: adding up the area_ac column of the file gives {ac(w_sum)} acres "
+                               f"(each polygon is rounded to 3 decimals)."))
+    check = [("  L1 area", "", ac(ul)),
+             ("  Difference", "", ac(diff), f"({abs(pct):.4f} %)  {'OK' if ok else 'CHECK'}")]
+    if not ok:
+        check.extend(_rows(f"WARNING: 81 + 82 differs from the area of L1 by {pct:.4f} % (more than 0.01 %)"))
+    if st["l1_overlap_groups"]:
+        check.extend(_rows(f"L1 polygons overlap each other in {st['l1_overlap_groups']:,} places; the overlap is "
+                           f"counted once, as remaining cane where both classes meet."))
+    if st["trimmed_82_pieces"]:
+        check.extend(_rows(f"{st['trimmed_82_pieces']:,} harvested pieces were cut back where they overlapped "
+                           f"remaining cane."))
+    noise = ("  Numerical noise removed", n(st["noise_overlay"] + st["noise"]), f"{st['noise_overlay_m2'] / ACRE_M2:.3f}")
+    if ans["rule"]:
+        small = [(f"Small harvested pieces (rule: {ans['sliver_acres']} acres or smaller AND touching remaining cane)",
+                  [("  Harvested pieces found", n(st["pieces"])),
+                   ("  Touching remaining cane", n(st["touching"])),
+                   ("  Changed to remaining cane", n(st["absorbed"]), ac(st["absorbed_acres"])), noise])]
+    else:
+        small = [("Cleaning (sliver rule is off)", [noise])]
+    crs_txt = area_crs.name if area_crs is not None else "?"
+    if area_crs is not None and area_crs.to_epsg():
+        crs_txt += f" (EPSG:{area_crs.to_epsg()})"
+    settings = [("  Sliver rule : " + (f"on, pieces of {ans['sliver_acres']} acres or smaller" if ans["rule"] else "off"),),
+                (f"  Projection  : {crs_txt}",),
+                ("  Classes     : " + {"both": "both (81 and 82)", "81": "81 only", "82": "82 only"}[ans["classes"]],)]
+    files = []
+    if out is not None:
+        cnt = f"{wst['count']:,} polygons" if wst else "polygons not counted"
+        if ans["classes"] != "both":
+            cnt += f", class {ans['classes']} only"
+        files.append((f"  Output : {out}   ({cnt})",))
+        if clean:
+            files.append(("  Cache  : removed after the run (--clean)",))
+        elif work is not None:
+            files.append((f"  Cache  : {work} ({_human_size(_folder_size(work))})",))
+            files.append(("           A rerun that only changes the sliver rule, the projection or the classes reuses it.",))
+            big = " It is large; delete it when you no longer need quick reruns." if _folder_size(work) > 500 * 1024 ** 2 else ""
+            files.append(("           Safe to delete." + big,))
+    sections = [("", table), ("Area check (remaining + harvested must equal L1)", check)] + small
+    sections += [("Settings used", settings), ("Files", files)]
+    if total_s is not None:
+        names = (("read", "read"), ("overlay", "overlay"), ("rule", "rule and areas"), ("dissolve", "dissolve"),
+                 ("write", "write"))
+        parts = " | ".join(f"{lab} {times[k]:.1f}" for k, lab in names if times and k in times)
+        sections.append(("", [(f"Time     : {total_s:.1f} s" + (f"  ({parts})" if parts else ""),)]))
+    print_result_block("RESULT", sections)
+    if summary_line:
+        _summary_lines(st, wst, ans)
 
 
 # ---------------------------------------------------------------- interactive mode
@@ -1225,6 +1359,8 @@ def main(argv=None):
     ap.add_argument("--memory-buffer-gb", type=float, default=None,
                     help="memory kept free (default 2, or 1.5 on machines with 8 GB RAM or less)")
     ap.add_argument("--clean", action="store_true", help="remove the work folder after success")
+    ap.add_argument("--summary-line", action="store_true",
+                    help="also print the machine-readable SUMMARY key=value lines after the result block")
     ap.add_argument("--ask", action="store_true", help="question-and-answer mode")
     a = ap.parse_args(argv)
     ask = a.ask or len(sys.argv if argv is None else argv) <= (1 if argv is None else 0)
@@ -1277,7 +1413,8 @@ def main(argv=None):
     utm = _validate_cli(a, ap)
     try:
         run(Path(pc.clean_path(a.final)), Path(pc.clean_path(a.l1)), Path(pc.clean_path(a.out)), a.sliver_acres,
-            not a.no_sliver_rule, utm, a.classes, allow_non_utm=a.allow_non_utm, assume_crs=a.assume_crs, **common)
+            not a.no_sliver_rule, utm, a.classes, allow_non_utm=a.allow_non_utm, assume_crs=a.assume_crs,
+            summary_line=a.summary_line, **common)
     except UserError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(2)
