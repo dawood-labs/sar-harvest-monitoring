@@ -64,7 +64,9 @@ def read_wkb(path):
 
 
 def time_parts(txt):
-    line = [x for x in txt.splitlines() if x.startswith("Time     :")][0]
+    lines = txt.splitlines()
+    i = [k for k, x in enumerate(lines) if x.startswith("Time     :")][0]
+    line = lines[i] + "".join(" " + x.strip() for x in lines[i + 1:i + 3] if x.startswith("     "))
     total = float(re.search(r"Time     : ([\d.]+) s", line).group(1))
     parts = {k.strip(): float(v) for k, v in re.findall(r"([a-zA-Z1 ]+?) ([\d.]+)(?: \||\))", line.split("(", 1)[1])}
     return total, parts
@@ -342,3 +344,128 @@ def test_post_chain_of_new_names_computes_once():
     assert "stage 1 overlay" not in t5 and "stage 2 sliver rule" in t5
     assert "stage 1 overlay" not in t6 and "stage 2" not in t6 and "Reusing saved work" in t6
     assert read_wkb(d / "f.gpkg") == read_wkb(d / "e.gpkg")
+
+
+# ---------------------------------------------------------------- same result for every tile size (seam vertices)
+def _whole_reference(mask, tf, l1_geoms, utm):
+    """No tiles, no blocks: polygonise the whole mask, union, intersect union(L1), explode, areas."""
+    from rasterio import features
+    polys = [shapely.geometry.shape(g) for g, _ in features.shapes(mask.view(np.uint8), mask=mask, transform=tf,
+                                                                   connectivity=4)]
+    cu = shapely.union_all(np.array(polys, dtype=object))
+    lu = shapely.union_all(np.array(l1_geoms, dtype=object))
+    parts = pc.polys_only(np.array([shapely.intersection(cu, lu)], dtype=object))
+    ac = pc.area_m2(parts, "EPSG:4326", utm) / pc.ACRE_M2
+    keep = ac * pc.ACRE_M2 >= pc.NOISE_M2
+    return sorted(zip(shapely.to_wkb(shapely.normalize(parts[keep])).tolist(), np.round(ac[keep], 3).tolist()))
+
+
+def test_pre_every_tile_size_gives_the_whole_array_result():
+    """Long straight edges in degrees on a coarse grid: extra vertices left on block/tile seams would
+    change the projected area (and did, by up to 0.1 acre). L1 edges on cell lines, a cane corner on
+    an L1 edge exactly on a block seam (a real vertex: must stay), cane crossing seams everywhere."""
+    d = Path(tempfile.mkdtemp())
+    px = 0.003                                   # about 330 m cells: long edges, visible curvature in UTM
+    tf = from_origin(4.0, 1.0, px, px)
+    a = np.full((60, 70), 4, np.uint8)
+    a[3:57, 5:66] = 1                            # big block crossing every seam
+    a[20:40, 30:50] = 4                          # hole
+    a[16:26, 0:12] = 1                           # touches the L1 edge (column 10) with corners on rows 16 / 26
+    a[44:52, 60:70] = 4
+    with rasterio.open(d / "r.tif", "w", driver="GTiff", height=60, width=70, count=1, dtype="uint8",
+                       crs="EPSG:4326", transform=tf) as o:
+        o.write(a, 1)
+    cell = lambda r0, c0, r1, c1: shapely.box(4.0 + c0 * px, 1.0 - r1 * px, 4.0 + c1 * px, 1.0 - r0 * px)  # noqa: E731
+    l1 = [cell(5, 10, 50, 64), cell(0, 40, 30, 70)]
+    pyogrio.raw.write(str(d / "l1.gpkg"), geometry=shapely.to_wkb(np.array(l1, dtype=object)), field_data=[], fields=[],
+                      geometry_type="Polygon", crs="EPSG:4326", driver="GPKG", layer="l1")
+    utm = pc.zone_crs(31, True)
+    for do_filter in (False, True):
+        mask = pc.majority_cane(a, None, 1, 1) if do_filter else (a == 1)
+        ref = _whole_reference(mask, tf, l1, utm)
+        old_block, pc.BLOCK = pc.BLOCK, 16      # block seams on rows / columns 16, 32, 48
+        os.environ["PREPROCESS_TEST_BLOCK"] = "16"
+        try:
+            for tile, lay in ((7, (1, 1)), (13, (1, 3)), (16, (2, 2)), (33, (1, 1)), (1000, (1, 1))):
+                out = d / f"o_{do_filter}_{tile}.gpkg"
+                quiet(pc.run, d / "r.tif", d / "l1.gpkg", out, min_acres=0.0, keep_slivers=True, do_filter=do_filter,
+                      tile_size=tile, processes=lay[0], threads=lay[1], max_memory_gb=1, utm="31N", clean=True)
+                got = read_wkb(out)
+                assert got == ref, (do_filter, tile, len(got), len(ref))
+        finally:
+            pc.BLOCK = old_block
+            os.environ.pop("PREPROCESS_TEST_BLOCK")
+
+
+def test_pre_signature_notices_same_size_same_time_new_content():
+    d = Path(tempfile.mkdtemp())
+    r, l1 = small_raster(d)
+    base = dict(cane_value=1, do_filter=True, neighbors=4, threshold="majority", keep_slivers=False, min_acres=0.2)
+    t0, _ = pc.stage_keys(r, l1, d / "o.shp", pc.zone_crs(31, True), base)
+    st = os.stat(r)
+    with rasterio.open(r, "r+") as o:            # same size (uncompressed), other cells
+        x = o.read(1)
+        x[:5] = 4 if x[0, 0] == 1 else 1
+        o.write(x, 1)
+    os.utime(r, ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert os.stat(r).st_size == st.st_size and os.stat(r).st_mtime_ns == st.st_mtime_ns
+    t1, _ = pc.stage_keys(r, l1, d / "o.shp", pc.zone_crs(31, True), base)
+    assert pc._hash(t0) != pc._hash(t1)
+    assert "has other content than at the last run" in pc.explain_changes(t0, t1)[1][0]
+
+
+# ---------------------------------------------------------------- wording and safety questions
+def test_post_alone_in_a_folder_says_what_is_missing():
+    import subprocess
+    d = Path(tempfile.mkdtemp())
+    src = Path(__file__).resolve().parents[1] / "src" / "postprocess_remaining.py"
+    (d / "postprocess_remaining.py").write_bytes(src.read_bytes())
+    p = subprocess.run([sys.executable, "-I", str(d / "postprocess_remaining.py"), "--help"], capture_output=True, text=True)
+    assert p.returncode == 1 and "Traceback" not in p.stderr
+    assert "Put preprocess_classified.py in the same folder as this file." in p.stderr
+
+
+def test_changed_shapefile_is_one_line_per_layer():
+    d = Path(tempfile.mkdtemp())
+    for ext in (".shp", ".shx", ".dbf", ".prj", ".cpg"):
+        (d / ("f" + ext)).write_bytes(b"x")
+    t0 = pc._file_sig(d / "f.shp", "l1")
+    time.sleep(0.01)
+    for ext in (".shp", ".shx", ".dbf"):
+        (d / ("f" + ext)).write_bytes(b"yy")
+    t1 = pc._file_sig(d / "f.shp", "l1")
+    older, why = pc.explain_changes({"version": 1, "final": t0}, {"version": 1, "final": t1}, ppr.KEY_NAMES)
+    assert not older and len(why) == 1 and why[0].startswith("The FINAL file f.shp was modified since the last run")
+    assert "changed .dbf .shp .shx" in why[0]
+
+
+def test_question_details():
+    d = Path(tempfile.mkdtemp())
+    r, l1 = small_raster(d)
+    answers = [str(r), str(l1), str(d), "o", "2", "", "", "", "", "9", "n", "7", "y", "n"]
+    _, txt = piped(pc.interactive, answers, dict(utm="EPSG:32632"))
+    assert "   Enter keeps your earlier choice: UTM 32N (EPSG:32632)" in txt
+    assert "That is large: pieces smaller than 9 acres will be removed. Use it? [y/N]" in txt
+    assert "   Type a smaller size." in txt and "slivers     : remove below 7.0 acres" in txt
+    _, txt = piped(pc.ask_output, [str(d), "bad:name", "ok", "1"], d, "x", {})
+    assert "[x]:    A file name cannot contain :" in txt          # hint indented like the prompts (3)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        pc.print_result_block("RESULT", [("Files", [("  Output : " + "/very/long" * 12 + "/out.gpkg",)])])
+    lines = out.getvalue().splitlines()
+    assert all(len(x) <= 80 for x in lines) and len(lines[0]) == len(lines[-1]) == 80
+    assert lines[3].startswith(" " * 11 + "very") or lines[3].startswith(" " * 11)
+
+
+def test_late_setting_change_lines():
+    d = Path(tempfile.mkdtemp())
+    r, l1 = small_raster(d)
+    quiet(pc.run, r, l1, d / "o.gpkg", min_acres=0.2, workers=2, max_memory_gb=1)
+    _, txt = quiet(pc.run, r, l1, d / "o.gpkg", min_acres=0.5, workers=2, max_memory_gb=1)
+    assert "Setting changed: sliver size (0.2 -> 0.5). Only the last step runs again." in txt
+    f, lp = post_case(d)
+    post_run(f, lp, d / "p.gpkg")
+    _, txt = post_run(f, lp, d / "p.gpkg", sliver_acres=0.5)
+    assert "Setting changed: sliver size (0.2 -> 0.5). Only the last steps run again" in txt
+    _, txt = post_run(f, lp, d / "p.gpkg", sliver_acres=0.5, classes="82")
+    assert "Setting changed: classes (both -> 82)" in txt and "Only the last step runs again." in txt

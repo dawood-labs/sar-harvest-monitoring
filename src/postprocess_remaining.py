@@ -61,7 +61,13 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import preprocess_classified as pc  # noqa: E402  (checks numpy, shapely, pyogrio, pyproj)
+try:
+    import preprocess_classified as pc  # noqa: E402  (checks numpy, shapely, pyogrio, pyproj)
+except ModuleNotFoundError as _e:
+    if _e.name != "preprocess_classified":
+        raise
+    sys.exit("ERROR: preprocess_classified.py was not found. Put preprocess_classified.py in the same folder "
+             "as this file.")
 
 import numpy as np  # noqa: E402
 import pyogrio  # noqa: E402
@@ -70,7 +76,7 @@ import pyproj  # noqa: E402
 import shapely  # noqa: E402
 from shapely import STRtree  # noqa: E402
 
-CACHE_VERSION = 1                     # bump whenever saved chunk results change meaning
+CACHE_VERSION = 2                     # bump whenever saved chunk results change meaning
 ACRE_M2 = 4046.85642
 REMAIN, HARVEST = 81, 82
 NOISE_M2 = 0.01                       # pieces below this area are numerical noise, always dropped
@@ -685,7 +691,8 @@ def stage_keys(final_path, l1_path, out, area_crs, a):
     return k1, k2, k3
 
 
-KEY_NAMES = {"final": "FINAL file", "l1": "L1 file", "assume_crs": "assume coordinate system", "epsg": "projection",
+KEY_NAMES = {"classes": "classes", "classes_key": "classification", "out": "output file", "final": "FINAL file",
+             "l1": "L1 file", "assume_crs": "assume coordinate system", "epsg": "projection",
              "rule": "sliver rule", "sliver_acres": "sliver size", "overlay": "overlay stage"}
 
 
@@ -795,7 +802,7 @@ def _run_locked(final, l1_path, out, work, wcrs, area_crs, ans, workers, max_mem
     elif man.get("k2") != k2:
         if man.get("k2"):
             _, why = pc.explain_changes(man.get("k2_items"), k2i, KEY_NAMES)
-            print(" ".join(why) + " The saved overlay stays valid; the later stages follow the new setting.")
+            print(" ".join(why) + " Only the last steps run again (the saved overlay is reused).")
         clean_work(work, 2)
     if man.get("overlay_done"):
         remove_valid_inputs(work)          # left by an older version of the tool
@@ -826,7 +833,7 @@ def _run_locked(final, l1_path, out, work, wcrs, area_crs, ans, workers, max_mem
     stage("plan", "plan (inputs and work folder checked)")
 
     # ---- nothing to do: the output is up to date
-    if man.get("k3") == k3 and out.exists() and man.get("stats"):
+    if man.get("k3") == k3 and out.exists() and man.get("stats") and man.get("out_sig") == pc._file_sig(out, "l1"):
         print(f"The output {out.name} was already up to date for these settings; nothing was written again.")
         progress("finished (up to date)", "finished")
         return _finish(man["stats"], man.get("written_stats", {}), ans, out, work, clean, times, notes,
@@ -929,6 +936,11 @@ def _run_locked(final, l1_path, out, work, wcrs, area_crs, ans, workers, max_mem
         pc._write_json(man_path, man)
         _clean_dir(s2)
     elif classified.parent == work:
+        why = []
+        if man.get("k3_items") and man.get("k3") != k3:
+            why = pc.explain_changes(man["k3_items"], k3i, KEY_NAMES)[1]
+        if why:
+            print(" ".join(why) + " Only the last step runs again.")
         print("reusing the saved classes (stage 2)")
 
     # ---- stage 3: write
@@ -938,7 +950,8 @@ def _run_locked(final, l1_path, out, work, wcrs, area_crs, ans, workers, max_mem
     if note:
         notes.append(note)
     if written == out:
-        man["k3"], man["written_stats"], man["stats"] = k3, wst, stats
+        man["k3"], man["k3_items"], man["written_stats"], man["stats"] = k3, k3i, wst, stats
+        man["out_sig"] = pc._file_sig(out, "l1")      # "up to date" only while the file is the one written here
         pc._write_json(man_path, man)
     return _finish(stats, wst, ans, written, work, clean, times, notes, area_crs, summary_line,
                    classified.parent if classified.parent != work else None)
@@ -1250,7 +1263,8 @@ def interactive(defaults):
                          defaults.get("rule", True))
     sliver = defaults.get("sliver_acres", 0.2)
     if rule:
-        sliver = pc.ask_text("   Largest piece size in acres (pieces <= this size change)", sliver, pc.parse_acres)
+        sliver = pc.ask_text("   Largest piece size in acres (pieces <= this size change)", sliver, pc.acres_check(
+            lambda v: f"   That is large: pieces up to {v:g} acres will become remaining cane. Use it?"))
     crs = pyproj.CRS(lc or fc)
     _, lb = pyogrio.read_bounds(str(l1))
     lb = np.asarray(lb).T
@@ -1267,9 +1281,11 @@ def interactive(defaults):
     else:
         print("5) The data cross the 180 degree meridian: no UTM zone can be suggested.")
     allow = False
+    dflt = pc.default_area_crs(defaults.get("utm"), crs, bounds, opts)
+    pc.say_earlier_choice(dflt)
     while True:
         utm = pc.ask_text("   Choose number, zone (e.g. 47N) or EPSG code" if opts else "   Type a zone (e.g. 1S) or EPSG code",
-                          pc.default_area_crs(defaults.get("utm"), crs, bounds, opts),
+                          dflt,
                           lambda a: pc.parse_crs_msg(a, north, opts))
         is_utm, far = pc.area_crs_notes(utm, crs, bounds)
         if not is_utm:
@@ -1444,6 +1460,9 @@ def main(argv=None):
     if not (a.final and a.l1 and a.out):
         ap.error("--final, --l1 and --out are required (or run without arguments for questions)")
     utm = _validate_cli(a, ap)
+    if a.sliver_acres > pc.LARGE_ACRES and not a.no_sliver_rule:
+        print(f"NOTE: --sliver-acres {a.sliver_acres:g} is large: harvested pieces up to {a.sliver_acres:g} acres that "
+              f"touch remaining cane become remaining cane.")
     try:
         run(Path(pc.clean_path(a.final)), Path(pc.clean_path(a.l1)), Path(pc.clean_path(a.out)), a.sliver_acres,
             not a.no_sliver_rule, utm, a.classes, allow_non_utm=a.allow_non_utm, assume_crs=a.assume_crs,
