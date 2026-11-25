@@ -111,7 +111,7 @@ if int(shapely.__version__.split(".")[0]) < 2:
 # polygonising an in-memory mask has no georeference by design (global filter: thread-safe)
 warnings.filterwarnings("ignore", category=rasterio.errors.NotGeoreferencedWarning)
 
-CACHE_VERSION = 5                     # bump whenever saved tiles/merge results change meaning
+CACHE_VERSION = 6                     # bump whenever saved tiles/merge results change meaning
 ACRE_M2 = 4046.85642
 PREDICTED = 81
 FINAL_GROUP_BYTES = 32 * 1024 ** 2   # final stage works on groups of about this much WKB (main process memory)
@@ -216,6 +216,30 @@ def status_text(state, progress):
     return f"{state}, {progress}"
 
 
+RESULT_WIDTH = 80
+
+
+def wrap_line(line, width=RESULT_WIDTH):
+    """A long line split at spaces or path separators; the next lines are indented to the text after
+    'Label : ' (or two more than the line's own indent). Short lines are returned unchanged."""
+    if len(line) <= width:
+        return [line]
+    lead = len(line) - len(line.lstrip(" "))
+    m = re.match(r"^(\s*\S[^:]{0,20}: )", line)
+    ind = " " * (len(m.group(1)) if m else lead + 2)
+    tokens = re.findall(r"[^ /\\]*[ /\\]|[^ /\\]+$", line)
+    out, cur = [], ""
+    for t in tokens:
+        if cur.strip() and len(cur) + len(t.rstrip()) > width:
+            out.append(cur.rstrip())
+            cur = ind + t.lstrip(" ")
+        else:
+            cur += t
+    if cur.strip():
+        out.append(cur.rstrip())
+    return out
+
+
 def print_result_block(title, sections):
     """Print a titled block (ASCII, aligned). sections = [(heading, rows)]; a row is a tuple of strings.
     Rows with 2+ cells are aligned in columns (first cell left, the next two right-aligned, any further
@@ -235,12 +259,12 @@ def print_result_block(title, sections):
             lines.append(heading)
         for r in rows:
             if len(r) == 1:
-                lines.append(r[0])
+                lines.extend(wrap_line(r[0], RESULT_WIDTH))
                 continue
             cells = [r[0].ljust(wid[0])] + [c.rjust(wid[i]) for i, c in enumerate(r[1:3], 1)]
             line = "  ".join(cells) + "".join("  " + c for c in r[3:])
             lines.append(line.rstrip())
-    width = max([48] + [len(x) for x in lines if len(x) <= 90])
+    width = RESULT_WIDTH
     head = f" {title} "
     print("=" * ((width - len(head)) // 2) + head + "=" * (width - len(head) - (width - len(head)) // 2))
     print("\n".join(lines))
@@ -1026,21 +1050,55 @@ def _on_grid(v, step, origin):
 
 
 def grid_protected(l1, tf):
-    """L1 vertices with exactly one coordinate on a cell-edge line (never removed as seam vertices)."""
+    """L1 vertices with a coordinate on a cell-edge line (never removed as seam vertices)."""
     if len(l1) == 0:
         return np.zeros((0, 2))
     xy = shapely.get_coordinates(l1)
     gx, gy = _on_grid(xy[:, 0], tf.a, tf.c), _on_grid(xy[:, 1], tf.e, tf.f)
-    return np.unique(xy[gx ^ gy], axis=0)
+    return np.unique(xy[gx | gy], axis=0)
 
 
-def _clean_crossings(polys, tf, protected):
-    """Remove vertices added where an L1 edge crosses a block/tile seam.
+def node_cells(src, p, rows, cols):
+    """Filtered cane value of the 4 cells around each grid node (row, col): arrays NW, NE, SW, SE.
+    Cells outside the raster are not cane. Each node is read as a tiny window, filtered exactly as
+    its tile (one-cell halo), so the answer does not depend on tiles or blocks."""
+    n = len(rows)
+    out = np.zeros((4, n), dtype=bool)
+    H, W = src.height, src.width
+    for k, (r, c) in enumerate(zip(np.asarray(rows).tolist(), np.asarray(cols).tolist())):
+        r0, c0, r1, c1 = max(r - 1, 0), max(c - 1, 0), min(r + 1, H), min(c + 1, W)
+        if r0 >= r1 or c0 >= c1:
+            continue
+        m = tile_cane(src, (r0, c0, r1, c1), p)
+        box = np.zeros((2, 2), dtype=bool)
+        box[r0 - (r - 1):r1 - (r - 1), c0 - (c - 1):c1 - (c - 1)] = m
+        out[:, k] = box[0, 0], box[0, 1], box[1, 0], box[1, 1]
+    return out
 
-    Such a vertex lies on a cell-edge line in one coordinate only and the boundary crosses that
-    line there (neither neighbour lies on it). Genuine vertices on a cell-edge line (where the
-    boundary turns onto a cane edge) have a neighbour on the line; L1 vertices are protected.
-    Vectorised over all rings; only polygons that lose a vertex are rebuilt."""
+
+def make_cane_at(raster, p):
+    """node_cells for one raster, opened once per call (thread-safe: nothing is shared)."""
+    def cane_at(rows, cols):
+        with rasterio.open(str(raster)) as src:
+            return node_cells(src, p, rows, cols)
+    return cane_at
+
+
+def _clean_crossings(polys, tf, protected, cane_at=None):
+    """Remove vertices that only exist because pieces of two blocks/tiles were unioned.
+
+    1. Where an L1 edge crosses a seam: such a vertex lies on a cell-edge line in one coordinate
+       only and the boundary crosses that line there (neither neighbour lies on it). Genuine
+       vertices on a cell-edge line (where the boundary turns onto a cane edge) have a neighbour on
+       the line.
+    2. (with cane_at) A vertex on a grid node in the middle of a straight horizontal or vertical
+       edge (both neighbours on the same line): the union of the pieces on both sides of a seam
+       leaves it there. It is removed unless the cane cells around the node turn there (then a run
+       without seams keeps it too). Such vertices change no shape, but they change the area after
+       projection (a straight lon/lat edge is not straight in UTM), so the result would depend on
+       the tile size.
+    L1 vertices are always kept. Vectorised over all rings; only polygons that lose a vertex are
+    rebuilt."""
     polys = np.asarray(polys, dtype=object)
     if len(polys) == 0:
         return polys
@@ -1060,6 +1118,18 @@ def _clean_crossings(polys, tf, protected):
     x, y = xy[:, 0], xy[:, 1]
     gx, gy = _on_grid(x, tf.a, tf.c), _on_grid(y, tf.e, tf.f)
     rm = (gx & ~gy & (x[prev] != x) & (x[nxt] != x)) | (gy & ~gx & (y[prev] != y) & (y[nxt] != y))
+    if cane_at is not None:
+        vert = gx & gy & (x[prev] == x) & (x[nxt] == x)
+        horz = gx & gy & (y[prev] == y) & (y[nxt] == y)
+        cand = np.flatnonzero(vert | horz)
+        if protected and len(cand):
+            cand = cand[np.array([(a, b) not in protected for a, b in xy[cand]], dtype=bool)]
+        if len(cand):
+            cc = np.rint((x[cand] - tf.c) / tf.a).astype(np.int64)
+            rr = np.rint((y[cand] - tf.f) / tf.e).astype(np.int64)
+            nw, ne, sw, se = cane_at(rr, cc)
+            straight = np.where(vert[cand], (nw == sw) & (ne == se), (nw == ne) & (sw == se))
+            rm[cand[straight]] = True
     if rm.any() and protected:
         k = np.flatnonzero(rm)
         rm[k] = np.array([(a, b) not in protected for a, b in xy[k]], dtype=bool)
@@ -1091,7 +1161,7 @@ def _spatial_order(geoms):
     return np.lexsort((cx, band))
 
 
-def merge_pieces(geoms, tf, protected=None, workers=1, budget=None, progress=False):
+def merge_pieces(geoms, tf, protected=None, workers=1, budget=None, progress=False, cane_at=None):
     """Union pieces that share a boundary segment of positive length (a shared corner does not
     join them), clean seam-crossing vertices, explode. Returns (pieces, number of merged groups)."""
     n = len(geoms)
@@ -1176,7 +1246,7 @@ def merge_pieces(geoms, tf, protected=None, workers=1, budget=None, progress=Fal
         else:
             res.extend(union_small(small))
     merged = polys_only(np.array(res, dtype=object))
-    out.append(_clean_crossings(merged, tf, protected))
+    out.append(_clean_crossings(merged, tf, protected, cane_at))
     return np.concatenate(out), total
 
 
@@ -1294,7 +1364,7 @@ def tile_pieces(src, win, p, l1):
     prot = grid_protected(l1, tf)
     seam = np.concatenate(seam) if seam else np.array([], dtype=object)
     if len(seam):
-        seam, _ = merge_pieces(seam, tf, prot, 1)
+        seam, _ = merge_pieces(seam, tf, prot, 1, cane_at=lambda rr, cc: node_cells(src, p, rr, cc))
     allp = np.concatenate(fin + [seam]) if (fin or len(seam)) else np.array([], dtype=object)
     if len(allp) == 0:
         return allp, np.zeros(0, bool), prot
@@ -2018,7 +2088,7 @@ def tidy_tiles(tiles_dir, wins, rows, cols):
         raise RuntimeError("tile files do not cover the raster exactly; delete the work folder and rerun")
 
 
-def merge_stage(work, tiles_dir, tf, workers, budget):
+def merge_stage(work, tiles_dir, tf, workers, budget, raster=None, params=None):
     """Union the seam pieces of neighbouring tiles (shared edges only) and save everything
     (tile pieces + merged seam pieces, raster CRS) in ONE file merged.bin (a stream of chunks)."""
     work, tiles_dir = Path(work), Path(tiles_dir)
@@ -2041,7 +2111,8 @@ def merge_stage(work, tiles_dir, tf, workers, budget):
     stats = {"n_raw": int(len(G)), "n_groups": 0}
     seam = np.array([], dtype=object)
     if len(G):
-        seam, stats["n_groups"] = merge_pieces(G, tf, P, workers, budget, progress=True)
+        cane_at = make_cane_at(raster, params) if raster is not None else None
+        seam, stats["n_groups"] = merge_pieces(G, tf, P, workers, budget, progress=True, cane_at=cane_at)
     del G, parts
     tmp = work / "merged.bin.tmp"
     n = 0
@@ -2228,12 +2299,32 @@ def _sig_paths(path, kind):
     return [p] + extra
 
 
+def _content_sample(path, n=16, size=4096):
+    """Hash of 16 small pieces spread over the file (the whole file when it is small): a file that
+    was replaced by other content with the same size and modification time is still noticed.
+    Costs 16 short reads, also for very large rasters."""
+    h = hashlib.sha1()
+    try:
+        total = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if total <= n * size:
+                h.update(f.read())
+            else:
+                for k in range(n):
+                    f.seek((total - size) * k // (n - 1))
+                    h.update(f.read(size))
+    except OSError:
+        return ""
+    return h.hexdigest()[:16]
+
+
 def _file_sig(path, kind="raster"):
+    """Signature of an input file and its sidecars: [name, size, modification time, content sample]."""
     files = []
     for q in _sig_paths(path, kind):
         if q.exists():
             st = os.stat(q)
-            files.append([q.name, st.st_size, st.st_mtime_ns])
+            files.append([q.name, st.st_size, st.st_mtime_ns, _content_sample(q)])
     return {"path": str(Path(path).resolve()), "files": files}
 
 
@@ -2250,13 +2341,14 @@ def stage_keys(raster, l1_path, out, utm_crs, a):
     return t, f
 
 
+FINAL_KEY_NAMES = {"epsg": "projection", "slivers": "sliver removal", "min_acres": "sliver size", "out": "output file"}
 TILE_KEY_NAMES = {"raster": "raster file", "l1": "L1 file", "cane_value": "cane value", "majority": "majority filter",
                   "neighbors": "number of neighbours", "threshold": "majority threshold", "block": "block size"}
 
 
 def _is_file_sig(v):
     return (isinstance(v, dict) and isinstance(v.get("path"), str) and isinstance(v.get("files"), list)
-            and all(isinstance(f, list) and len(f) == 3 for f in v["files"]))
+            and all(isinstance(f, list) and len(f) == 4 for f in v["files"]))
 
 
 def _file_state(f, precise=False):
@@ -2295,12 +2387,29 @@ def explain_changes(old, new, names=None):
             out.append(f"A different {label} is used (before: {o['path']}; now: {n['path']}).")
             continue
         of, nf = {f[0]: f for f in o["files"]}, {f[0]: f for f in n["files"]}
-        for name in sorted(set(of) | set(nf)):
-            if name not in of:
-                out.append(f"The file {name} ({label}) was added since the last run.")
-            elif name not in nf:
-                out.append(f"The file {name} ({label}) was removed since the last run.")
-            elif of[name] != nf[name]:
+        main = Path(n["path"]).name
+        added = [m for m in sorted(nf) if m not in of]
+        removed = [m for m in sorted(of) if m not in nf]
+        changed = [m for m in sorted(set(of) & set(nf)) if of[m] != nf[m]]
+        if len(added) + len(removed) + len(changed) == 0:
+            continue
+        if len(added) + len(removed) + len(changed) > 1:      # a shapefile: one line for the layer
+            parts = [f"{what} {' '.join(Path(m).suffix or m for m in names_)}" for what, names_ in
+                     (("changed", changed), ("added", added), ("removed", removed)) if names_]
+            line = f"The {label} {main} was modified since the last run ({'; '.join(parts)}"
+            if main in changed and of[main][:3] != nf[main][:3]:
+                line += f"; {main} before: {_file_state(of[main])}, now: {_file_state(nf[main])}"
+            out.append(line + ").")
+            continue
+        for name in added:
+            out.append(f"The file {name} ({label}) was added since the last run.")
+        for name in removed:
+            out.append(f"The file {name} ({label}) was removed since the last run.")
+        for name in changed:
+            if of[name][:3] == nf[name][:3]:
+                out.append(f"The file {name} ({label}) has other content than at the last run (same size and "
+                           f"time: {_file_state(nf[name])}).")
+            else:
                 exact = _file_state(of[name]) == _file_state(nf[name])
                 out.append(f"The file {name} ({label}) was modified since the last run "
                            f"(before: {_file_state(of[name], exact)}; now: {_file_state(nf[name], exact)}).")
@@ -2534,7 +2643,8 @@ def _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs
 
     times = {"plan": tick(f"plan ({rows}x{cols} cells, {cane_cells:,} cane cells)")}
     out_ok = out.exists()
-    if old and old.get("final_key") == fkey and out_ok and merged.exists() and old.get("final_stats"):
+    if old and old.get("final_key") == fkey and out_ok and merged.exists() and old.get("final_stats") \
+            and old.get("final_out_sig") == _file_sig(out, "l1"):   # the file is still the one written then
         progress("finished (up to date)", "finished")
         s = old["final_stats"]
         res = _result(s, out)
@@ -2551,7 +2661,7 @@ def _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs
         times["tiles"] = tick("tiles (filter, polygonise, clip)")
         tidy_tiles(tiles_dir, wins, rows, cols)
         progress("merging seams")
-        st = merge_stage(work, tiles_dir, tf, w, budget)
+        st = merge_stage(work, tiles_dir, tf, w, budget, raster, params)
         times["merge"] = tick(f"merge seams: {st['n_raw']:,} seam pieces, {st['n_groups']:,} merged groups, "
                               f"{st['n_pieces']:,} pieces saved")
         clean_work_tiles(tiles_dir)
@@ -2559,7 +2669,13 @@ def _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs
             if (work / nm).exists():
                 (work / nm).unlink()
     elif src_work is None:
-        print("reusing the saved tile and merge results (only the final stage runs)")
+        why = []
+        if old and old.get("final_items") and old.get("final_key") != fkey:
+            why = explain_changes(old["final_items"], fkey_items, FINAL_KEY_NAMES)[1]
+        if why:
+            print(" ".join(why) + " Only the last step runs again.")
+        else:
+            print("reusing the saved tile and merge results (only the final stage runs)")
     progress("writing output")
     s, written, note = final_stage(merged, out, crs, utm_crs, ans["min_acres"], ans["keep_slivers"], w)
     times["write"] = tick(f"final stage: areas, slivers, write {written}")
@@ -2569,6 +2685,7 @@ def _run_locked(raster, l1_path, out, work, rows, cols, crs, tf, nodata, utm_crs
     if written == out:
         manifest["final_key"] = fkey
         manifest["final_stats"] = s
+        manifest["final_out_sig"] = _file_sig(out, "l1")
         _write_json(man_path, manifest)
     print_run_result(s, ans, utm_crs, written, work, clean, merged, notes[shown:], None, times, run_seconds(),
                      summary_line, src_work)
@@ -2679,7 +2796,7 @@ def ask_text(question, default=None, check=None):
         ans = _input(f"{question}{tail}: ").strip()
         if ans == "":
             if default in (None, ""):
-                print("  Please type an answer.")
+                print("   Please type an answer.")
                 continue
             ans = str(default)
         if check is None:
@@ -2687,7 +2804,7 @@ def ask_text(question, default=None, check=None):
         val, hint = check(ans)
         if hint is None:
             return val
-        print(f"  {hint}")
+        print(f"   {hint}")
 
 
 def ask_yes_no(question, default=True):
@@ -2699,7 +2816,7 @@ def ask_yes_no(question, default=True):
             return True
         if ans in ("n", "no"):
             return False
-        print("  Please answer y or n.")
+        print("   Please answer y or n.")
 
 
 def _file_check(exts, what):
@@ -2843,6 +2960,28 @@ def made_by_this_tool(p):
         return False
 
 
+def say_earlier_choice(dflt):
+    """When the default is the previous answer (not list number 1), say so on its own line, so that
+    the default and the 'suggested' mark of the list do not look contradictory."""
+    if dflt and dflt != "1":
+        crs = parse_crs_msg(dflt, True, None)[0]
+        if crs is not None:
+            print(f"   Enter keeps your earlier choice: {crs_label(crs).split(' / ', 1)[-1].replace('UTM zone ', 'UTM ')}")
+
+
+LARGE_ACRES = 5.0
+
+
+def acres_check(warning):
+    """parse_acres plus a confirmation above LARGE_ACRES; warning(v) is the question text."""
+    def check(a):
+        v, hint = parse_acres(a)
+        if hint is None and v > LARGE_ACRES and not ask_yes_no(warning(v), False):
+            return None, "Type a smaller size."
+        return v, hint
+    return check
+
+
 def default_area_crs(text, raster_crs, bounds, opts):
     """Previous answer as default only if it fits this raster (a detected zone or within one zone
     of the data centre); otherwise the detected suggestion [1]."""
@@ -2896,9 +3035,11 @@ def interactive(defaults):
     else:
         print("5) The data cross the 180 degree meridian: no UTM zone can be suggested.")
     allow = False
+    dflt = default_area_crs(defaults.get("utm"), crs, bounds, opts)
+    say_earlier_choice(dflt)
     while True:
         utm = ask_text("   Choose number, zone (e.g. 47N) or EPSG code" if opts else "   Type a zone (e.g. 1S) or EPSG code",
-                       default_area_crs(defaults.get("utm"), crs, bounds, opts),
+                       dflt,
                        lambda a: parse_crs_msg(a, north, opts))
         is_utm, far = area_crs_notes(utm, crs, bounds)
         if not is_utm:
@@ -2915,7 +3056,8 @@ def interactive(defaults):
     slivers = ask_yes_no("6) Remove slivers?", defaults.get("slivers", True))
     min_acres = defaults.get("min_acres", 0.2)
     if slivers:
-        min_acres = ask_text("   Minimum area in acres", min_acres, parse_acres)
+        min_acres = ask_text("   Minimum area in acres", min_acres, acres_check(
+            lambda v: f"   That is large: pieces smaller than {v:g} acres will be removed. Use it?"))
 
     print("\nYour answers:")
     print(f"  raster      : {raster}\n  L1 layer    : {l1}\n  output      : {out}")
@@ -3095,6 +3237,8 @@ def main(argv=None):
     if not (a.raster and a.l1 and a.out):
         ap.error("--raster, --l1 and --out are required (or run without arguments for questions)")
     utm = _validate_cli(a, ap)
+    if a.min_acres > LARGE_ACRES and not a.keep_slivers:
+        print(f"NOTE: --min-acres {a.min_acres:g} is large: pieces smaller than {a.min_acres:g} acres are removed.")
     try:
         run(Path(clean_path(a.raster)), Path(clean_path(a.l1)), Path(clean_path(a.out)), a.min_acres,
             utm, keep_slivers=a.keep_slivers, do_filter=not a.no_filter, neighbors=a.neighbors,
